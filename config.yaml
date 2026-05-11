@@ -1,0 +1,18 @@
+# Global project configuration.
+#
+# Shared values live at the top level. Per-script settings are namespaced
+# under the script name.
+
+# CRS of every coordinate stored in this project (graph, nodes/edges in
+# DuckDB, sidewalk widths, ...). Matches the tile2net source graph.
+crs: "EPSG:25830"
+
+# Used by scripts/initialize.py
+initialize:
+  paths:
+    graph_path: "data/graph.gpickle"
+    db_path: "data/network.duckdb"
+  # Edge attributes to copy from the source graph onto the `edges` table
+  # (in addition to the implicit `length` -> `distance` mapping).
+  attributes:
+    - width
