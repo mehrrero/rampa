@@ -1,12 +1,16 @@
-.PHONY: help install download
+.PHONY: help install initialize api
 
 help:
 	@echo "Available targets:"
-	@echo "  install   Sync dependencies via uv"
-	@echo "  download  Download the orthophoto catalogue (scripts/orto.py)"
+	@echo "  install     Sync dependencies via uv"
+	@echo "  initialize  Build the DuckDB network from the pickled OSMnx graph"
+	@echo "  api         Launch the FastAPI app with auto-reload"
 
 install:
 	uv sync
 
-download:
-	uv run python -m scripts.orto
+initialize:
+	uv run python -m scripts.initialize
+
+api:
+	uv run uvicorn src.api:app --reload
