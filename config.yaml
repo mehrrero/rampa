@@ -5,14 +5,24 @@
 
 # CRS of every coordinate stored in this project (graph, nodes/edges in
 # DuckDB, sidewalk widths, ...). Matches the tile2net source graph.
-crs: "EPSG:25830"
+crs: "EPSG:25829"
 
 # Used by scripts/initialize.py
 initialize:
   paths:
     graph_path: "data/graph.gpickle"
     db_path: "data/network.duckdb"
+    dem_path: "data/mdt_lidar.tif"
   # Edge attributes to copy from the source graph onto the `edges` table
   # (in addition to the implicit `length` -> `distance` mapping).
   attributes:
     - width
+  # Per-edge elevation derived from a DEM raster (PNOA-LiDAR MDT05 by default).
+  # Comment out the whole block to skip elevation during `make initialize`.
+  elevation:
+    samples_per_edge: 8
+    # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
+    wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
+    coverage_id: "Elevacion4258_5"
+    coverage_crs: "EPSG:4258"
+    bbox_pad_m: 50.0
