@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
 import json
@@ -19,7 +20,13 @@ with open(CONFIG_PATH) as fh:
     cfg = yaml.safe_load(fh)
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("App is starting…")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Permissive CORS for development; restrict `allow_origins` to known
 # frontend origins before deploying. `allow_credentials=True` + "*" is
@@ -33,11 +40,12 @@ app.add_middleware(
 
 network = Network(cfg["initialize"]["paths"]["db_path"])
 
-@app.on_event("startup")
-def startup_event():
-    print("App is starting…")
-    
-    
+
+@app.get("/health")
+async def healthcheck():
+    return {"status": "ok"}
+
+
 @app.get("/ruta")
 async def create_route(
     x1: float,

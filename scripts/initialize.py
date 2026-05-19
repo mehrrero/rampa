@@ -141,13 +141,19 @@ def fetch_dem(
     """Download a DEM raster covering ``bbox`` from a WCS endpoint.
 
     Steps:
-        1. Skip if a non-empty file already exists at ``out_path`` — re-running
-           the initialise pipeline shouldn't re-fetch megabytes every time.
-        2. Pad the bbox by ``pad_m`` metres so edges near the border still have
+        1. Pad the bbox by ``pad_m`` metres so edges near the border still have
            valid samples after CRS-projection rounding, then transform from
            ``bbox_crs`` to the coverage's native CRS.
-        3. Build a WCS 2.0.1 ``GetCoverage`` GET request and write the response
-           body to ``out_path``.
+        2. If a non-empty file already exists at ``out_path``, open it and skip
+           the fetch only when its bounds actually enclose the requested bbox —
+           a stale cache from a different city is otherwise easy to miss.
+        3. Plan a tile grid: the IDEE WCS caps each response at 4096 px per
+           side, so divide the bbox into sub-tiles small enough to fit. The
+           coverage's native resolution (``_5`` → 5 m, ``_25`` → 25 m, …) is
+           parsed from the coverage id.
+        4. Issue one WCS 2.0.1 ``GetCoverage`` per tile. If the plan is 1×1
+           write the response body straight to ``out_path``; otherwise write
+           each tile to a temp file and mosaic them with ``rasterio.merge``.
 
     Default coverage is `Elevacion4258_5` (5 m PNOA-LiDAR-derived MDT) on the
     IDEE INSPIRE WCS, but every relevant param is exposed so other coverages
@@ -159,17 +165,22 @@ def fetch_dem(
     handling here.
     """
     # Lazy imports — these deps are only needed when the elevation step runs.
+    import math
+    import re
+    import tempfile
+
+    import rasterio
     import requests
+    from rasterio.errors import RasterioIOError
+    from rasterio.merge import merge as rio_merge
     from rasterio.warp import transform_bounds
 
     out_path = Path(out_path)
 
-    # ─── 1. cache check ─────────────────────────────────────────────────────
-    if out_path.exists() and out_path.stat().st_size > 0:
-        logger.info("DEM already present, skipping fetch: %s", out_path)
-        return out_path
-
-    # ─── 2. bbox: pad in graph CRS, then project to the coverage's CRS ──────
+    # ─── 1. bbox: pad in graph CRS, then project to the coverage's CRS ──────
+    # Done before the cache check so we can verify the cached raster
+    # actually covers what we need (a stale cache from a different city
+    # otherwise silently feeds compute_elevation, which then produces zeros).
     minx, miny, maxx, maxy = bbox
     minx -= pad_m
     miny -= pad_m
@@ -183,34 +194,129 @@ def fetch_dem(
         bbox_crs, pad_m, coverage_crs, west, east, south, north,
     )
 
-    # ─── 3. build & send WCS 2.0.1 GetCoverage ──────────────────────────────
+    # ─── 2. cache check ─────────────────────────────────────────────────────
+    # Existence is necessary but not sufficient — verify the cached raster's
+    # bounds enclose the requested bbox. Otherwise we re-fetch.
+    if out_path.exists() and out_path.stat().st_size > 0:
+        try:
+            with rasterio.open(out_path) as src:
+                b = src.bounds
+                src_crs = str(src.crs) if src.crs else None
+                if (
+                    src_crs is not None
+                    and src_crs.replace("EPSG:", "") != coverage_crs.replace("EPSG:", "")
+                ):
+                    c_west, c_south, c_east, c_north = transform_bounds(
+                        src_crs, coverage_crs, b.left, b.bottom, b.right, b.top
+                    )
+                else:
+                    c_west, c_south, c_east, c_north = b.left, b.bottom, b.right, b.top
+            covers = (
+                c_west <= west and c_east >= east
+                and c_south <= south and c_north >= north
+            )
+            if covers:
+                logger.info("DEM cache covers requested bbox, skipping fetch: %s", out_path)
+                return out_path
+            logger.info(
+                "Cached DEM at %s doesn't cover requested bbox "
+                "(cache lon[%.5f..%.5f] lat[%.5f..%.5f]) — re-fetching.",
+                out_path, c_west, c_east, c_south, c_north,
+            )
+        except RasterioIOError as e:
+            logger.warning("Cached DEM at %s unreadable (%s) — re-fetching.", out_path, e)
+
+    # ─── 3. tile plan — server caps each request at 4096 px per side ────────
+    # Coverage ids on this WCS end in the native resolution in metres
+    # (`Elevacion4258_5` → 5 m, `_25` → 25 m). If the full bbox would
+    # exceed MAX_TILE_PX on either axis, split into a grid and mosaic.
+    res_match = re.search(r"_(\d+)$", coverage_id)
+    res_m = float(res_match.group(1)) if res_match else 5.0
+    MAX_TILE_PX = 3800  # margin under the server's MAXSIZE=4096
+    mid_lat = 0.5 * (south + north)
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lon = m_per_deg_lat * math.cos(math.radians(mid_lat))
+    h_px = (north - south) * m_per_deg_lat / res_m
+    w_px = (east - west) * m_per_deg_lon / res_m
+    n_rows = max(1, math.ceil(h_px / MAX_TILE_PX))
+    n_cols = max(1, math.ceil(w_px / MAX_TILE_PX))
+    lat_step = (north - south) / n_rows
+    lon_step = (east - west) / n_cols
+    logger.info(
+        "Tile plan: %dx%d tiles (full ~%.0fx%.0f px at %.1fm res)",
+        n_rows, n_cols, h_px, w_px, res_m,
+    )
+
+    # ─── 4. build & send WCS 2.0.1 GetCoverage(s) ───────────────────────────
     # WCS 2.0.1 takes one `subset` per axis; requests repeats list values, so
     # passing a 2-list yields `&subset=Lat(...)&subset=Long(...)`. The axis
     # labels MUST be the coverage's native ones — for EPSG:4258 that's
     # Lat/Long, not E/N (which would 404 with InvalidAxisLabel).
-    params = {
+    base_params = {
         "service": "WCS",
         "version": "2.0.1",
         "request": "GetCoverage",
         "CoverageID": coverage_id,
         "format": "image/tiff",
         "subsettingcrs": coverage_crs,
-        "subset": [f"Lat({south},{north})", f"Long({west},{east})"],
     }
-    logger.info("WCS GetCoverage %s (%s)…", wcs_url, coverage_id)
-    resp = requests.get(wcs_url, params=params, timeout=timeout)
 
-    # On error the server sends an OGC ExceptionReport (XML). Surface it.
-    ctype = resp.headers.get("Content-Type", "")
-    if resp.status_code != 200 or "xml" in ctype or "html" in ctype:
-        raise RuntimeError(
-            f"WCS GetCoverage failed: HTTP {resp.status_code}, "
-            f"Content-Type={ctype}\nURL: {resp.url}\n"
-            f"Body (first 800 chars):\n{resp.text[:800]}"
-        )
+    def _fetch_tile(tw: float, ts: float, te: float, tn: float) -> bytes:
+        params = {**base_params, "subset": [f"Lat({ts},{tn})", f"Long({tw},{te})"]}
+        resp = requests.get(wcs_url, params=params, timeout=timeout)
+        ctype = resp.headers.get("Content-Type", "")
+        if resp.status_code != 200 or "xml" in ctype or "html" in ctype:
+            raise RuntimeError(
+                f"WCS GetCoverage failed: HTTP {resp.status_code}, "
+                f"Content-Type={ctype}\nURL: {resp.url}\n"
+                f"Body (first 800 chars):\n{resp.text[:800]}"
+            )
+        return resp.content
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(resp.content)
+
+    if n_rows == 1 and n_cols == 1:
+        # Common case — single request, persist the server's bytes as-is.
+        logger.info("WCS GetCoverage %s (%s)…", wcs_url, coverage_id)
+        out_path.write_bytes(_fetch_tile(west, south, east, north))
+    else:
+        # Multi-tile: write each tile to a temp dir, then mosaic with
+        # rasterio.merge. Adjacent tiles share an exact lon/lat boundary;
+        # the WCS server expands each request to its native pixel grid, so
+        # neighbouring tiles end up touching or slightly overlapping —
+        # rio_merge handles both.
+        with tempfile.TemporaryDirectory() as td:
+            tile_paths: list[Path] = []
+            for r in range(n_rows):
+                for c in range(n_cols):
+                    tw = west + c * lon_step
+                    te = west + (c + 1) * lon_step
+                    ts = south + r * lat_step
+                    tn = south + (r + 1) * lat_step
+                    idx = r * n_cols + c + 1
+                    logger.info(
+                        "  tile %d/%d: lon[%.5f..%.5f] lat[%.5f..%.5f]",
+                        idx, n_rows * n_cols, tw, te, ts, tn,
+                    )
+                    tp = Path(td) / f"tile_{r}_{c}.tif"
+                    tp.write_bytes(_fetch_tile(tw, ts, te, tn))
+                    tile_paths.append(tp)
+
+            srcs = [rasterio.open(p) for p in tile_paths]
+            try:
+                mosaic, transform = rio_merge(srcs)
+                meta = srcs[0].meta.copy()
+            finally:
+                for s in srcs:
+                    s.close()
+            meta.update({
+                "height": mosaic.shape[1],
+                "width": mosaic.shape[2],
+                "transform": transform,
+            })
+            with rasterio.open(out_path, "w", **meta) as dst:
+                dst.write(mosaic)
+
     logger.info(
         "Saved %.1f MB → %s", out_path.stat().st_size / 1e6, out_path
     )
@@ -400,14 +506,39 @@ def compute_accesibility_distance(
     db_path: str | Path,
     attributes: list[str] | None = None,
     threshold: float = 1.50,
+    k_up: float = 38.0,
+    k_down: float = 23.0,
+    slope_cap: float = 0.30,
 ) -> None:
     """Compute `accesibility` and `alt_distance` on the edges table.
 
-    An edge is accessible (``accesibility = 1``) if its first
-    accessibility-driving attribute (``attributes[0]``, default ``width``)
-    is at least ``threshold``; NULLs are treated as 0. ``alt_distance``
-    is then ``distance / 10**accesibility``, so accessible edges are 10x
-    cheaper when routed via the alt network.
+    The width gate stays as before — an edge gets ``accesibility = 1`` when
+    its first accessibility-driving attribute (``attributes[0]``, default
+    ``width``) is at least ``threshold``; NULLs score as 0.
+
+    ``alt_distance`` is then the Option-2 asymmetric-exponential cost from
+    docs/alt_distance_proposal.pdf:
+
+        C = L · exp(k_up · max(s, 0) + k_down · max(-s, 0)) / 10**accesibility
+
+    where ``L = distance`` and ``s = slope`` (signed grade). Because edges
+    are stored directed (initialize.py mirrors undirected source edges),
+    the (u→v) and (v→u) rows naturally swap s+ ↔ s− and the asymmetry is
+    encoded without per-row branching.
+
+    Defaults are CTE-anchored: ``k_up = ln(10)/0.06 ≈ 38`` (TMA/851
+    itinerario peatonal accesible limit) and ``k_down = ln(10)/0.10 ≈ 23``
+    (steepest legal short ramp under DB-SUA 1 §4.3). Edges with NULL slope
+    (no elevation column, or all-nodata samples) coalesce to s = 0 → the
+    cost reduces to the pure width formula.
+
+    ``slope_cap`` clamps |s| before the exponential. The DEM is 5 m
+    resolution, so any edge much shorter than that picks up quantisation
+    noise (e.g. a 4 cm segment that straddles a 5 m pixel boundary reports
+    slope ≈ 20+). Capping at 0.30 (30%) keeps spurious slopes from
+    overflowing ``exp(k * s)`` while remaining well above any real
+    accessible grade — the capped edge ends up with a uniform large
+    penalty rather than a NaN/inf cost.
     """
     col = (attributes or ["width"])[0]
 
@@ -427,18 +558,60 @@ def compute_accesibility_distance(
             END
             """
         )
-        con.execute(
-            "UPDATE edges SET alt_distance = distance / POWER(10, accesibility)"
-        )
+
+        # If the elevation step never ran, there's no `slope` column — fall
+        # back to the pure width formula so the pipeline still produces a
+        # usable alt_distance.
+        has_slope = bool(con.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'edges' AND column_name = 'slope'"
+        ).fetchone())
+
+        if has_slope:
+            # `s_clipped` clamps |s| to [-slope_cap, slope_cap] so 5m-DEM
+            # noise on near-zero-length edges (e.g. slope=23 on a 4cm segment)
+            # can't overflow exp(k*s) to +inf.
+            con.execute(
+                f"""
+                UPDATE edges
+                SET alt_distance = distance
+                    * EXP({k_up}   * GREATEST(LEAST( COALESCE(slope, 0.0),  {slope_cap}), 0.0)
+                        + {k_down} * GREATEST(LEAST(-COALESCE(slope, 0.0),  {slope_cap}), 0.0))
+                    / POWER(10, accesibility)
+                """
+            )
+        else:
+            logger.warning(
+                "No `slope` column on edges — skipping slope penalty, "
+                "alt_distance falls back to distance / 10^accesibility."
+            )
+            con.execute(
+                "UPDATE edges SET alt_distance = distance / POWER(10, accesibility)"
+            )
 
         accessible, total = con.execute(
             "SELECT SUM(accesibility), COUNT(*) FROM edges"
         ).fetchone()
-        logger.info(
-            "Accessibility on %s: %d/%d edges accessible "
-            "(col=%r, threshold=%.2f)",
-            db_path, accessible, total, col, threshold,
-        )
+        if has_slope:
+            mean_r, med_r, max_r = con.execute(
+                "SELECT AVG(alt_distance / distance), "
+                "       quantile_cont(alt_distance / distance, 0.5), "
+                "       MAX(alt_distance / distance) "
+                "FROM edges WHERE distance > 0"
+            ).fetchone()
+            logger.info(
+                "Accessibility on %s: %d/%d edges accessible "
+                "(col=%r, threshold=%.2f, k_up=%.1f, k_down=%.1f); "
+                "alt_distance/distance: mean=%.3f, median=%.3f, max=%.3f",
+                db_path, accessible, total, col, threshold, k_up, k_down,
+                mean_r, med_r, max_r,
+            )
+        else:
+            logger.info(
+                "Accessibility on %s: %d/%d edges accessible "
+                "(col=%r, threshold=%.2f) [no slope]",
+                db_path, accessible, total, col, threshold,
+            )
     finally:
         con.close()
 
@@ -491,7 +664,12 @@ if __name__ == "__main__":
             samples_per_edge=elev_cfg.get("samples_per_edge", 8),
         )
 
+    acc_cfg = section.get("accessibility") or {}
     compute_accesibility_distance(
         db_path=paths_cfg["db_path"],
         attributes=section.get("attributes") or [],
+        threshold=acc_cfg.get("width_threshold", 1.50),
+        k_up=acc_cfg.get("k_up", 38.0),
+        k_down=acc_cfg.get("k_down", 23.0),
+        slope_cap=acc_cfg.get("slope_cap", 0.30),
     )

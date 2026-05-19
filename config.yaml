@@ -5,7 +5,7 @@
 
 # CRS of every coordinate stored in this project (graph, nodes/edges in
 # DuckDB, sidewalk widths, ...). Matches the tile2net source graph.
-crs: "EPSG:25829"
+crs: "EPSG:25830"
 
 # Used by scripts/initialize.py
 initialize:
@@ -26,3 +26,17 @@ initialize:
     coverage_id: "Elevacion4258_5"
     coverage_crs: "EPSG:4258"
     bbox_pad_m: 50.0
+  # Accessibility cost model (alt_distance) — Option 2 from
+  # docs/alt_distance_proposal.pdf:
+  #   alt_distance = distance * exp(k_up*max(s,0) + k_down*max(-s,0))
+  #                            / 10^accesibility
+  # Defaults are CTE-anchored: k_up = ln(10)/0.06 (TMA/851 6% itinerary
+  # limit), k_down = ln(10)/0.10 (DB-SUA 1 §4.3 steepest short-ramp limit).
+  accessibility:
+    width_threshold: 1.50
+    k_up: 38.0
+    k_down: 23.0
+    # Clamp |slope| before the exponential so DEM noise on near-zero-length
+    # edges (5 m raster, sub-metre segments) can't push exp(k*s) to +inf.
+    # 0.30 is well above any real accessible grade.
+    slope_cap: 0.30
