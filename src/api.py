@@ -14,8 +14,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.network import Network
 
 
-# Project-root config.yaml (this file lives in src/).
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+# Project-root config/config.yaml (this file lives in src/).
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
 with open(CONFIG_PATH) as fh:
     cfg = yaml.safe_load(fh)
 

@@ -11,10 +11,9 @@
 #     rampa-api
 #
 # On startup the entrypoint seeds config/config.yaml from a baked-in default if
-# the folder has none. The app reads a fixed /app/config.yaml (src/api.py), which
-# the entrypoint symlinks onto config/config.yaml; the DB path inside it
-# ("data/network.duckdb") is relative to the workdir, so WORKDIR is /app and the
-# data mount must land there.
+# the folder has none. The app reads /app/config/config.yaml (src/api.py); the DB
+# path inside it ("data/network.duckdb") is relative to the workdir, so WORKDIR is
+# /app and the data mount must land there.
 
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
@@ -46,7 +45,7 @@ COPY scripts ./scripts
 # Baked-in default config, copied into the config volume on first start by the
 # entrypoint if the volume has none. Not the live config — that lives in the
 # mounted /app/config folder.
-COPY config.yaml ./config.default.yaml
+COPY config/config.yaml ./config.default.yaml
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

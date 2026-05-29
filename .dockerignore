@@ -5,11 +5,12 @@
 .venv
 .DS_Store
 
-# Runtime data lives in a volume (see Dockerfile). config.yaml is kept in the
-# context on purpose: it's baked in as config.default.yaml and seeded into the
-# mounted config/ folder on first start.
+# Runtime data lives in a volume (see Dockerfile). config/config.yaml is kept in
+# the context on purpose: it's baked in as config.default.yaml and seeded into
+# the mounted config/ folder on first start.
 data/
 config/
+!config/config.yaml
 
 # Notebooks, docs, and local tooling are not needed by the API.
 example.ipynb
