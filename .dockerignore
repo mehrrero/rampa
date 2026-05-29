@@ -1,0 +1,23 @@
+# Keep the build context small and the image free of host-only artifacts.
+# Runtime inputs are mounted as volumes, never copied in.
+.git
+.gitignore
+.venv
+.DS_Store
+
+# Runtime data lives in a volume (see Dockerfile). config.yaml is kept in the
+# context on purpose: it's baked in as config.default.yaml and seeded into the
+# mounted config/ folder on first start.
+data/
+config/
+
+# Notebooks, docs, and local tooling are not needed by the API.
+example.ipynb
+docs/
+README.md
+Makefile
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
