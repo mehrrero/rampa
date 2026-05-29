@@ -19,7 +19,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 # pandana's wheel links against OpenMP at runtime; the slim image lacks it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 \
+    && apt-get install -y --no-install-recommends libgomp1 g++ \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

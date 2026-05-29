@@ -66,7 +66,7 @@ class Network:
         # is defensive — leave it in case a subclass calls `__init__` again.
         if hasattr(self, "db_connection") and self.db_connection is not None:
             self.db_connection.close()
-        self.db_connection = duckdb.connect(db_path)
+        self.db_connection = duckdb.connect(db_path, read_only=True)
 
         self.__get_network()
 

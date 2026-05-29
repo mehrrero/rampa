@@ -83,7 +83,7 @@ curl http://localhost:8000/health
 Compute a route between two coordinates.
 
 ```bash
-curl "http://localhost:8000/ruta?x1=699200&y1=4824000&x2=700000&y2=4823000"
+curl "http://localhost:8000/ruta?x1=726550.22584&y1=4369304.840704&x2=725639.632903&y2=4374012.487261"
 ```
 
 #### Query parameters
@@ -109,9 +109,29 @@ curl "http://localhost:8000/ruta?x1=699200&y1=4824000&x2=700000&y2=4823000"
 }
 ```
 
-- **`ruta`** — shortest path by raw distance.
+- **`ruta`** — shortest path by raw distance (GeoJSON FeatureCollection).
 - **`ruta_alt`** or **`ruta_veh_a`** — shortest path weighted by the accessibility model (key depends on `mode`).
 - **`metadata`** — per-route total length in meters.
+
+Each feature in the GeoJSON `FeatureCollection` represents a sidewalk edge with the following `properties`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `from` | int | Source node ID |
+| `to` | int | Target node ID |
+| `distance` | float | Edge length (m) |
+| `width` | float | Sidewalk width (m) |
+| `z_from`, `z_to` | int | Elevation level at endpoints |
+| `z_min`, `z_max` | int | Min / max elevation level along the edge |
+| `d_elev` | float | Elevation difference (m) |
+| `slope` | float | Slope (m/m) |
+| `kerb_type` | string or null | Kerb type description (e.g. `"ACERA BORDILLO"`) |
+| `kerb` | bool | Whether a kerb is present |
+| `kerb_cross` | int | Number of kerb crossings |
+| `access_veh_a` | bool | Whether a type-A PMV lane is accessible |
+| `accesibility` | int | Accessibility flag (1 = accessible, 0 = not) |
+| `alt_distance` | float | Accessibility-weighted distance (m) |
+| `veh_a_distance` | float | Type-A PMV weighted distance (m) |
 
 #### Error responses
 
