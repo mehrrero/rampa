@@ -1,139 +1,277 @@
 # rampa
 
-Pedestrian routing over a sidewalk network, with optional accessibility
-weighting (wider sidewalks preferred). The graph comes from a
-[tile2net](https://github.com/VIDA-NYU/tile2net) export, is persisted in
-DuckDB, and is served through a small FastAPI endpoint.
+**Pedestrian sidewalk routing with accessibility weighting.**
 
-All coordinates throughout the project are in the CRS declared in
-[`config.yaml`](config.yaml) — currently **EPSG:25830** (ETRS89 / UTM
-30N, meters).
+Given a sidewalk network — originally exported from [tile2net](https://github.com/VIDA-NYU/tile2net) — `rampa` computes shortest-path routes that optionally prefer wider, flatter sidewalks and account for kerb crossings and type-A personal-mobility-vehicle (PMV) lanes. The cost model follows Spanish accessibility regulations (CTE / DB-SUA / Orden TMA/851).
 
+The network is persisted in [DuckDB](https://duckdb.org/) and served through a small [FastAPI](https://fastapi.tiangolo.com/) endpoint.
 
-## Install
+All coordinates are in **EPSG:25830** (ETRS89 / UTM 30N, meters) — see [`config.yaml`](config.yaml).
 
-```bash
-uv sync
-```
+---
 
-(Requires Python 3.12 and [`uv`](https://docs.astral.sh/uv/).)
+## Quick start
 
+### Local (no Docker)
 
-## One-time setup: build the DuckDB
-
-The repo ships with a pickled tile2net graph at `data/graph.gpickle`.
-Turn it into the routable DuckDB used by the rest of the code:
+Requirements: Python 3.12 + [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv run python scripts/initialize.py
+# 1. Install dependencies
+make install
+
+# 2. One-time: build the DuckDB from the pickle graph
+make initialize
+
+# 3. Run the API with hot-reload
+make api
 ```
 
-That runs two steps:
+The API is then available at `http://localhost:8000`.
 
-1. **`load_graph`** reads the gpickle and writes `nodes` and `edges`
-   tables. Tile2net node ids are coordinate tuples and the graph is
-   undirected; the script remaps ids to integers, mirrors each edge so
-   pandana can route in both directions, and persists every edge's
-   geometry as WKB.
-2. **`compute_accesibility_distance`** adds two columns to `edges`:
-   - `accesibility = 1` if `width >= threshold` (default 1.50 m),
-     else 0.
-   - `alt_distance = distance / 10**accesibility` — accessible edges
-     become 10x cheaper, so shortest-path on `alt_distance` prefers
-     them.
+---
 
-Inputs come from `config.yaml`:
+## Docker
 
-```yaml
-initialize:
-  paths:
-    graph_path: "data/graph.gpickle"
-    db_path: "data/network.duckdb"
-  attributes:
-    - width
+### docker-compose (recommended)
+
+```bash
+docker compose up --build
 ```
 
+This builds the image, mounts `./config` and `./data` from the host, and serves the API on port `8000`.
 
-## Use it from Python
+### Manual docker run
 
-```python
-import yaml
-from src.network import Network
-
-with open("config.yaml") as fh:
-    cfg = yaml.safe_load(fh)
-
-net = Network(cfg["initialize"]["paths"]["db_path"])
-
-origin      = (699200.0, 4824000.0)   # (x, y) in EPSG:25830
-destination = (700000.0, 4823000.0)
-
-# Node-id sequence
-nodes = net.route(origin, destination)
-
-# GeoDataFrame of the route edges
-route = net.route_gdf(origin, destination)
-
-# Accessibility-weighted alternative
-alt_route = net.route_gdf(origin, destination, alternate=True)
+```bash
+docker build -t rampa-api .
+docker run --rm -p 8000:8000 \
+  -v "$PWD/config:/app/config" \
+  -v "$PWD/data:/app/data:ro" \
+  rampa-api
 ```
 
-`route_gdf` returns `None` when an endpoint is farther than
-`max_snap_distance` (default 500 m) from any node or when the endpoints
-are in disconnected components. See [`example.ipynb`](example.ipynb) for
-a full walkthrough including plotting and a primary-vs-alternate
-comparison.
+**Volume notes:**
 
+| Volume | Mount | Writable? | Purpose |
+|--------|-------|-----------|---------|
+| `./config` | `/app/config` | Yes | `config.yaml` — seeded from defaults on first start |
+| `./data` | `/app/data` | No (ro) | `network.duckdb`, `graph.gpickle`, DEM raster |
 
-## Run the API
+> The database at `data/network.duckdb` is **already checked into the repo** for Valencia. If you're starting from scratch, run `make initialize` locally first (or copy a built database into `./data/`).
+
+---
+
+## API endpoints
+
+### `GET /health`
+
+Health check.
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{"status": "ok"}
+```
+
+---
+
+### `GET /ruta`
+
+Compute a route between two coordinates.
+
+```bash
+curl "http://localhost:8000/ruta?x1=699200&y1=4824000&x2=700000&y2=4823000"
+```
+
+#### Query parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `x1`, `y1` | float | yes | — | Origin (x, y) in the network CRS (EPSG:25830) |
+| `x2`, `y2` | float | yes | — | Destination (x, y) in the network CRS |
+| `mode` | string | no | `alt` | Accessibility route: `"alt"` (general accessibility) or `"veh_a"` (type-A PMV lanes) |
+| `max_snap_m` | float | no | `500` | Max snap distance (meters) from input coordinate to nearest network node. `≤ 0` disables the check |
+
+#### Response format
+
+```json
+{
+  "ruta": { /* GeoJSON FeatureCollection */ },
+  "ruta_alt": { /* GeoJSON FeatureCollection */ },
+  "mode": "alt",
+  "metadata": {
+    "ruta": { "total_length": 1250.7 },
+    "ruta_alt": { "total_length": 1342.3 }
+  }
+}
+```
+
+- **`ruta`** — shortest path by raw distance.
+- **`ruta_alt`** or **`ruta_veh_a`** — shortest path weighted by the accessibility model (key depends on `mode`).
+- **`metadata`** — per-route total length in meters.
+
+#### Error responses
+
+| Status | Meaning |
+|--------|---------|
+| `400` | Unknown `mode` or `veh_a` unavailable (DB lacks the column) |
+| `404` | Endpoint too far from network or endpoints in disconnected components |
+
+---
+
+## Frontend integration
+
+### JavaScript / TypeScript (fetch)
+
+```js
+const params = new URLSearchParams({
+  x1: "699200", y1: "4824000",
+  x2: "700000", y2: "4823000",
+  mode: "alt",
+});
+
+const res = await fetch(`http://localhost:8000/ruta?${params}`);
+const data = await res.json();
+
+// data.ruta              — primary route (GeoJSON FeatureCollection)
+// data.ruta_alt          — accessibility route (GeoJSON FeatureCollection)
+// data.metadata.ruta.total_length         — primary route length (meters)
+// data.metadata.ruta_alt.total_length     — accessibility route length (meters)
+```
+
+### React + MapLibre/Leaflet example
+
+```tsx
+import { useEffect, useState } from "react";
+import type { FeatureCollection } from "geojson";
+
+interface RouteResponse {
+  ruta: FeatureCollection;
+  ruta_alt: FeatureCollection;
+  mode: "alt" | "veh_a";
+  metadata: Record<string, { total_length: number }>;
+}
+
+function RouteMap() {
+  const [route, setRoute] = useState<RouteResponse | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams({
+      x1: "699200", y1: "4824000",
+      x2: "700000", y2: "4823000",
+      mode: "alt",
+    });
+
+    fetch(`http://localhost:8000/ruta?${params}`)
+      .then((r) => r.json())
+      .then(setRoute);
+  }, []);
+
+  // Render geojson on your map library of choice
+}
+```
+
+> **CORS:** The API ships with `allow_origins=["*"]` for development. Restrict to your frontend origin before deploying.
+
+### OpenAPI / Swagger
+
+Interactive API docs at `http://localhost:8000/docs` (auto-generated by FastAPI).
+
+---
+
+## Local development
+
+### One-time setup
+
+```bash
+make install
+make initialize
+```
+
+`make initialize` runs `scripts/initialize.py`, which:
+
+1. **`load_graph`** — reads `data/graph.gpickle`, remaps coordinate-tuple node IDs to integers, mirrors undirected edges for pandana, and writes `nodes` / `edges` tables to DuckDB.
+2. **`fetch_dem` + `compute_elevation`** — downloads a LiDAR DEM (IDEE WCS), samples elevation per edge, writes slope.
+3. **`compute_valencia_features`** — fetches kerb and type-A PMV lane polylines from Valencia's open-data API, joins spatially onto edges.
+4. **`compute_accesibility_distance`** — applies the accessibility cost model.
+
+### Run the API
+
+```bash
+make api
+```
+
+Or directly:
 
 ```bash
 uv run uvicorn src.api:app --reload --port 8000
 ```
 
-Then:
+### Demo notebook
 
-- Interactive docs: <http://localhost:8000/docs>
-- Direct call:
-  ```bash
-  curl "http://localhost:8000/ruta?x1=699200&y1=4824000&x2=700000&y2=4823000"
-  ```
+[`example.ipynb`](example.ipynb) contains a full walkthrough with plots, network statistics, accessibility maps, and route comparisons.
 
-Query parameters:
+---
 
-| name         | required | default | description                                       |
-| ------------ | -------- | ------- | ------------------------------------------------- |
-| `x1`, `y1`   | yes      | —       | Origin (x, y) in the network CRS                  |
-| `x2`, `y2`   | yes      | —       | Destination (x, y) in the network CRS             |
-| `max_snap_m` | no       | 500     | Max snap distance to nearest node; ≤ 0 disables   |
+## Configuration
 
-The response is `{"ruta": <GeoJSON>, "ruta_alt": <GeoJSON>}`. A 404 is
-returned when no route can be produced.
+All settings live in [`config.yaml`](config.yaml):
 
+```yaml
+crs: "EPSG:25830"                        # Coordinate reference system
+
+initialize:
+  paths:
+    graph_path: "data/graph.gpickle"     # tile2net source graph
+    db_path: "data/network.duckdb"       # built DuckDB
+    dem_path: "data/mdt_lidar.tif"       # LiDAR DEM
+  elevation:                             # Per-edge slope computation
+    samples_per_edge: 8
+    wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
+    coverage_id: "Elevacion4258_5"
+  valencia:                              # Open-data overlays
+    kerb_url: "…"                        # ArcGIS REST: kerbs (bordillos)
+    type_a_url: "…"                      # ArcGIS REST: type-A PMV lanes
+    kerb_tol_m: 4.0
+    lane_tol_m: 5.0
+  accessibility:                         # Cost model parameters
+    width_threshold: 1.50
+    k_up: 38.0
+    k_down: 23.0
+    slope_cap: 0.30
+    k_kerb: 2.302585092994046
+    kerb_cross_cap: 2
+```
+
+Comment out the `elevation` or `valencia` blocks to skip those steps during `make initialize`.
+
+---
 
 ## Project layout
 
 ```
 .
-├── config.yaml           # Shared project config (CRS + per-script sections)
+├── config.yaml                 # Shared configuration (CRS, paths, cost model)
+├── docker-compose.yml          # Docker orchestration
+├── Dockerfile                  # Multi-stage API image
+├── docker-entrypoint.sh        # Container entrypoint (seeds config)
+├── Makefile                    # Convenience targets: install, initialize, api
+├── pyproject.toml              # Python dependencies (uv)
+├── uv.lock                     # Locked dependency tree
 ├── data/
-│   ├── graph.gpickle     # tile2net source graph
-│   └── network.duckdb    # built by scripts/initialize.py
+│   ├── graph.gpickle           # tile2net source graph (OSMnx)
+│   ├── network.duckdb          # Built DuckDB (nodes, edges, accessibility)
+│   └── mdt_lidar.tif           # Digital Elevation Model (LiDAR)
 ├── scripts/
-│   └── initialize.py     # gpickle -> DuckDB pipeline
+│   └── initialize.py           # Data pipeline: gpickle → DuckDB
 ├── src/
-│   ├── network.py        # Network class: routing on top of the DuckDB
-│   └── api.py            # FastAPI app exposing /ruta
-└── example.ipynb         # Demo notebook
+│   ├── api.py                  # FastAPI application (/ruta, /health)
+│   └── network.py              # Network class (pandana routing engine)
+├── docs/
+│   ├── alt_distance_proposal.pdf
+│   └── alt_distance_proposal.tex
+└── example.ipynb               # Demo notebook with plots
 ```
-
-
-## Notes on the data
-
-- Node coordinates are stored *as-is* in EPSG:25830, so `distance` and
-  `alt_distance` are in meters.
-- tile2net graphs can be heavily fragmented (many small connected
-  components — crosswalks and curb cuts that didn't get stitched
-  upstream). Check connectivity before routing across the whole bbox;
-  see the `pick-endpoints` cell in `example.ipynb` for an example using
-  `networkx.connected_components`.

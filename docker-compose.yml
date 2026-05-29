@@ -1,0 +1,15 @@
+# Runs the rampa API with config.yaml and data/ kept on the host (outside
+# the image) and mounted in. Start with:  docker compose up --build
+services:
+  api:
+    build: .
+    image: rampa-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Runtime inputs live on the host, not in the image. The config folder is
+      # writable so the entrypoint can seed config.yaml with the default on
+      # first start; data is read-only (the API only reads the network DB).
+      - ./config:/app/config
+      - ./data:/app/data:ro
+    restart: unless-stopped

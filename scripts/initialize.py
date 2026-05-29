@@ -8,6 +8,7 @@ the schema expected by `src.network.Network.__get_network` on reload.
 from __future__ import annotations
 
 import logging
+import math
 import pickle
 from pathlib import Path
 from typing import Any
@@ -233,11 +234,12 @@ def fetch_dem(
     res_match = re.search(r"_(\d+)$", coverage_id)
     res_m = float(res_match.group(1)) if res_match else 5.0
     MAX_TILE_PX = 3800  # margin under the server's MAXSIZE=4096
-    mid_lat = 0.5 * (south + north)
-    m_per_deg_lat = 111_320.0
-    m_per_deg_lon = m_per_deg_lat * math.cos(math.radians(mid_lat))
-    h_px = (north - south) * m_per_deg_lat / res_m
-    w_px = (east - west) * m_per_deg_lon / res_m
+    # IDEE's EPSG:4258 coverage lays pixels on an isotropic *degree* grid —
+    # the server does NOT scale lon by cos(lat). Use the lat factor on both
+    # axes or we under-count width and oversize tiles past MAXSIZE=4096.
+    deg_per_px = res_m / 111_320.0
+    h_px = (north - south) / deg_per_px
+    w_px = (east - west) / deg_per_px
     n_rows = max(1, math.ceil(h_px / MAX_TILE_PX))
     n_cols = max(1, math.ceil(w_px / MAX_TILE_PX))
     lat_step = (north - south) / n_rows
@@ -502,6 +504,220 @@ def compute_elevation(
         con.close()
 
 
+def _arcgis_get(url: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """POST an ArcGIS REST query and return the parsed JSON, with retries.
+
+    Uses POST (not GET) so the envelope filter and `resultOffset` pagination
+    don't blow past URL-length limits, and retries a few times because the
+    Valencia geoportal occasionally drops a connection mid-page.
+    """
+    import json as _json
+    import time
+    import urllib.parse
+    import urllib.request
+
+    body = urllib.parse.urlencode(params).encode()
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=body)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return _json.load(resp)
+        except Exception as e:  # noqa: BLE001 — network errors are varied
+            last_err = e
+            time.sleep(2.0 * (attempt + 1))
+    raise RuntimeError(f"ArcGIS query failed after retries: {url}") from last_err
+
+
+def _fetch_arcgis_polylines(
+    layer_url: str,
+    crs: str,
+    bbox: tuple[float, float, float, float] | None = None,
+    out_fields: str = "*",
+    page: int = 2000,
+    timeout: float = 180.0,
+):
+    """Fetch an ArcGIS REST polyline layer as a GeoDataFrame in `crs`.
+
+    The Valencia geoportal caps each response at `maxRecordCount` (2000)
+    features, so this pages through with `resultOffset` until a short page
+    comes back. When `bbox` (xmin, ymin, xmax, ymax, in `crs`) is given the
+    query is restricted to that envelope server-side — essential here since
+    the kerb layer alone is ~50k features city-wide and our graph usually
+    covers a small slice. Esri polyline geometries carry one or more `paths`;
+    a single path becomes a LineString, several become a MultiLineString.
+    """
+    import geopandas as gpd
+    from shapely.geometry import LineString, MultiLineString
+
+    epsg = str(crs).split(":")[-1]
+    base = {
+        "where": "1=1",
+        "outFields": out_fields,
+        "returnGeometry": "true",
+        "outSR": epsg,
+        "f": "json",
+    }
+    if bbox is not None:
+        xmin, ymin, xmax, ymax = bbox
+        base.update({
+            "geometry": f"{xmin},{ymin},{xmax},{ymax}",
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": epsg,
+            "spatialRel": "esriSpatialRelIntersects",
+        })
+
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        data = _arcgis_get(
+            layer_url + "/query",
+            {**base, "resultOffset": offset, "resultRecordCount": page},
+            timeout,
+        )
+        chunk = data.get("features", [])
+        for ft in chunk:
+            paths = (ft.get("geometry") or {}).get("paths") or []
+            lines = [LineString(p) for p in paths if len(p) >= 2]
+            if not lines:
+                continue
+            geom = lines[0] if len(lines) == 1 else MultiLineString(lines)
+            rows.append({**ft.get("attributes", {}), "geometry": geom})
+        # A page shorter than the limit means we've drained the layer.
+        if not chunk or len(chunk) < page:
+            break
+        offset += len(chunk)
+
+    if not rows:
+        return gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=crs)
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+
+
+def compute_valencia_features(
+    db_path: str | Path,
+    crs: str,
+    kerb_url: str,
+    type_a_url: str,
+    kerb_tol_m: float = 4.0,
+    lane_tol_m: float = 5.0,
+    timeout: float = 180.0,
+) -> None:
+    """Attach Valencia open-data overlays to the edges table.
+
+    Pulls two polyline layers from the Valencia geoportal (both native
+    EPSG:25830, the project CRS) and joins them onto each edge by spatial
+    proximity, writing three columns:
+
+        kerb         (BOOLEAN) — a kerb line runs within `kerb_tol_m`
+        kerb_type    (VARCHAR) — `elemento` of the nearest kerb
+                                 (BORDILLO / BORDILLO JARDINERO / ACERA BORDILLO)
+        access_veh_a (BOOLEAN) — edge lies within `lane_tol_m` of a lane where
+                                 type-A personal-mobility vehicles may circulate
+
+    Sources:
+        - cartografia-base-vorades-bordillos  (kerbs / bordillos)
+        - vehiculos-movilidad-personal-tipo-a (type-A PMV lanes)
+
+    Each layer is fetched restricted to the graph's bounding box (read from
+    the `nodes` table and padded by the join tolerance) to keep the download
+    small. The join uses `sjoin_nearest` with a `max_distance` cutoff, so an
+    edge with no overlay feature within tolerance simply gets False / NULL.
+    Edges lacking a stored geometry are left as False / NULL too. The function
+    is idempotent — it rewrites the edges table atomically via CREATE OR
+    REPLACE.
+    """
+    import geopandas as gpd
+    from shapely import wkb
+
+    con = duckdb.connect(str(db_path))
+    try:
+        edges = con.execute("SELECT * FROM edges").fetchdf()
+        logger.info("Loaded %d edges for Valencia overlay join", len(edges))
+
+        # ─── 1. graph bbox (padded by the join tolerance) for server-side
+        #         filtering, so we don't download the whole city. ────────────
+        xmin, ymin, xmax, ymax = con.execute(
+            "SELECT min(x), min(y), max(x), max(y) FROM nodes"
+        ).fetchone()
+        pad = max(kerb_tol_m, lane_tol_m) + 5.0
+        bbox = (xmin - pad, ymin - pad, xmax + pad, ymax + pad)
+
+        # ─── 2. edges → GeoDataFrame (positional `_pos` keeps the link back to
+        #         the original rows; rows without geometry are dropped). ──────
+        geoms = [
+            wkb.loads(bytes(g)) if isinstance(g, (bytes, bytearray)) and g else None
+            for g in edges["geometry"]
+        ]
+        e = gpd.GeoDataFrame(
+            {"_pos": range(len(edges))},
+            geometry=gpd.GeoSeries(geoms, crs=crs),
+        )
+        e = e[e.geometry.notna()].copy()
+
+        # ─── 3. fetch the three overlays within the bbox ────────────────────
+        kerbs = _fetch_arcgis_polylines(
+            kerb_url, crs, bbox=bbox, out_fields="elemento", timeout=timeout
+        )
+        lanes_a = _fetch_arcgis_polylines(
+            type_a_url, crs, bbox=bbox, out_fields="gid", timeout=timeout
+        )
+        logger.info(
+            "Fetched overlays in bbox: %d kerbs, %d type-A lanes",
+            len(kerbs), len(lanes_a),
+        )
+
+        # ─── 4. kerbs: nearest kerb within tolerance → type + boolean ───────
+        edges["kerb_type"] = None
+        if not kerbs.empty:
+            j = gpd.sjoin_nearest(
+                e, kerbs[["elemento", "geometry"]],
+                how="inner", max_distance=kerb_tol_m, distance_col="_d",
+            )
+            # An edge can tie to several kerb lines; keep the closest one.
+            j = j.sort_values("_d").drop_duplicates("_pos")
+            edges["kerb_type"] = edges.index.map(dict(zip(j["_pos"], j["elemento"])))
+        edges["kerb"] = edges["kerb_type"].notna()
+
+        # Kerb *crossings*: the number of kerb lines the edge geometrically
+        # crosses (transversal), as opposed to running parallel to one. This
+        # is the accessibility-relevant signal — a curb the route must mount —
+        # whereas the near-uniform parallel boundary (the `kerb` flag above)
+        # is not a barrier. A full street crossing typically scores 2 (one
+        # kerb on each side); along-sidewalk travel scores 0.
+        edges["kerb_cross"] = 0
+        if not kerbs.empty:
+            jc = gpd.sjoin(e, kerbs[["geometry"]], how="inner", predicate="crosses")
+            counts = jc.groupby("_pos").size()
+            edges["kerb_cross"] = (
+                counts.reindex(edges.index, fill_value=0).astype("int64").to_numpy()
+            )
+
+        # ─── 5. vehicle lanes: presence within tolerance → boolean ──────────
+        def _near(layer) -> set[int]:
+            if layer.empty:
+                return set()
+            j = gpd.sjoin_nearest(
+                e, layer[["geometry"]], how="inner", max_distance=lane_tol_m
+            )
+            return set(j["_pos"].tolist())
+
+        edges["access_veh_a"] = edges.index.isin(_near(lanes_a))
+
+        # ─── 6. write the enriched edges back atomically ────────────────────
+        con.register("df_edges", edges)
+        con.execute("CREATE OR REPLACE TABLE edges AS SELECT * FROM df_edges")
+        logger.info(
+            "Valencia features written: kerb=%d, kerb_cross>0=%d, access_veh_a=%d "
+            "(of %d edges)",
+            int(edges["kerb"].sum()),
+            int((edges["kerb_cross"] > 0).sum()),
+            int(edges["access_veh_a"].sum()),
+            len(edges),
+        )
+    finally:
+        con.close()
+
+
 def compute_accesibility_distance(
     db_path: str | Path,
     attributes: list[str] | None = None,
@@ -509,6 +725,8 @@ def compute_accesibility_distance(
     k_up: float = 38.0,
     k_down: float = 23.0,
     slope_cap: float = 0.30,
+    k_kerb: float = math.log(10),
+    kerb_cross_cap: int = 2,
 ) -> None:
     """Compute `accesibility` and `alt_distance` on the edges table.
 
@@ -525,6 +743,26 @@ def compute_accesibility_distance(
     are stored directed (initialize.py mirrors undirected source edges),
     the (u→v) and (v→u) rows naturally swap s+ ↔ s− and the asymmetry is
     encoded without per-row branching.
+
+    A crossing-based kerb factor (Option 5 of the proposal) is then folded in
+    multiplicatively:
+
+        C ← C · exp(k_kerb · kerb_cross)
+
+    where ``kerb_cross`` (written by ``compute_valencia_features``) counts the
+    kerb lines the edge actually crosses — curbs the route must mount. With the
+    CTE-anchored default ``k_kerb = ln(10)``, each crossing multiplies the cost
+    by 10 (one accessibility tier), so a typical two-kerb street crossing costs
+    ×100. If the ``kerb_cross`` column is absent the factor is 1 (no-op).
+
+    ``kerb_cross`` is clamped to ``kerb_cross_cap`` (default 2) before the
+    exponential. A real street crossing traverses at most two curbs (one per
+    side); larger counts are artifacts of the fragmented kerb layer (median
+    ~7 m segments), where a long or skewed edge skims many separate pieces.
+    Without the cap those edges reach ``exp(ln(10)·16) = 10**16``, which both
+    misrepresents the barrier and gives ``alt_distance`` a ~20-order-of-magnitude
+    dynamic range that makes pandana's contraction-hierarchy build pathologically
+    slow.
 
     Defaults are CTE-anchored: ``k_up = ln(10)/0.06 ≈ 38`` (TMA/851
     itinerario peatonal accesible limit) and ``k_down = ln(10)/0.10 ≈ 23``
@@ -589,9 +827,51 @@ def compute_accesibility_distance(
                 "UPDATE edges SET alt_distance = distance / POWER(10, accesibility)"
             )
 
+        # Crossing-based kerb penalty (Option 5): fold in a multiplicative
+        # factor exp(k_kerb * kerb_cross). Skipped cleanly when the Valencia
+        # step never ran and the column is absent.
+        has_kerb = bool(con.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'edges' AND column_name = 'kerb_cross'"
+        ).fetchone())
+        if has_kerb:
+            con.execute(
+                f"UPDATE edges SET alt_distance = alt_distance "
+                f"* EXP({k_kerb} * LEAST(COALESCE(kerb_cross, 0), {kerb_cross_cap}))"
+            )
+
+        # Type-A PMV metric: the *same* cost as alt_distance but with the
+        # pedestrian width gate (10^accesibility) replaced by the
+        # vehicle-accessibility gate (10^access_veh_a). Derived from alt_distance
+        # — divide out the width gate, divide in the vehicle gate — so the
+        # slope/kerb terms can never drift between the two metrics. An edge on a
+        # type-A lane is 10× cheaper; off-lane edges pay full.
+        has_veh_a = bool(con.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'edges' AND column_name = 'access_veh_a'"
+        ).fetchone())
+        if has_veh_a:
+            con.execute("ALTER TABLE edges ADD COLUMN IF NOT EXISTS veh_a_distance DOUBLE")
+            con.execute(
+                "UPDATE edges SET veh_a_distance = alt_distance "
+                "* POWER(10, accesibility) "
+                "/ POWER(10, CASE WHEN COALESCE(access_veh_a, FALSE) THEN 1 ELSE 0 END)"
+            )
+
         accessible, total = con.execute(
             "SELECT SUM(accesibility), COUNT(*) FROM edges"
         ).fetchone()
+        if has_kerb:
+            n_pen, max_x = con.execute(
+                "SELECT COUNT(*) FILTER (WHERE COALESCE(kerb_cross, 0) > 0), "
+                "MAX(kerb_cross) FROM edges"
+            ).fetchone()
+            logger.info(
+                "Kerb crossing penalty (k_kerb=%.3f, cap=%d) applied to %d edges "
+                "(max %s raw crossings on one edge; penalty capped at ×%.0f)",
+                k_kerb, kerb_cross_cap, n_pen, max_x,
+                math.exp(k_kerb * kerb_cross_cap),
+            )
         if has_slope:
             mean_r, med_r, max_r = con.execute(
                 "SELECT AVG(alt_distance / distance), "
@@ -611,6 +891,17 @@ def compute_accesibility_distance(
                 "Accessibility on %s: %d/%d edges accessible "
                 "(col=%r, threshold=%.2f) [no slope]",
                 db_path, accessible, total, col, threshold,
+            )
+        if has_veh_a:
+            on_lane, veh_mean = con.execute(
+                "SELECT SUM(CAST(COALESCE(access_veh_a, FALSE) AS INTEGER)), "
+                "       AVG(veh_a_distance / distance) "
+                "FROM edges WHERE distance > 0"
+            ).fetchone()
+            logger.info(
+                "Type-A metric (veh_a_distance) written: %d/%d edges on a type-A "
+                "lane; veh_a_distance/distance mean=%.3f",
+                on_lane, total, veh_mean,
             )
     finally:
         con.close()
@@ -664,6 +955,20 @@ if __name__ == "__main__":
             samples_per_edge=elev_cfg.get("samples_per_edge", 8),
         )
 
+    # Valencia open-data overlays (kerbs + PMV-accessible lanes) — only runs
+    # if the `valencia` block exists in config.
+    val_cfg = section.get("valencia")
+    if val_cfg:
+        compute_valencia_features(
+            db_path=paths_cfg["db_path"],
+            crs=crs,
+            kerb_url=val_cfg["kerb_url"],
+            type_a_url=val_cfg["type_a_url"],
+            kerb_tol_m=val_cfg.get("kerb_tol_m", 4.0),
+            lane_tol_m=val_cfg.get("lane_tol_m", 5.0),
+            timeout=val_cfg.get("timeout", 180.0),
+        )
+
     acc_cfg = section.get("accessibility") or {}
     compute_accesibility_distance(
         db_path=paths_cfg["db_path"],
@@ -672,4 +977,6 @@ if __name__ == "__main__":
         k_up=acc_cfg.get("k_up", 38.0),
         k_down=acc_cfg.get("k_down", 23.0),
         slope_cap=acc_cfg.get("slope_cap", 0.30),
+        k_kerb=acc_cfg.get("k_kerb", math.log(10)),
+        kerb_cross_cap=acc_cfg.get("kerb_cross_cap", 2),
     )

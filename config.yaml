@@ -26,6 +26,18 @@ initialize:
     coverage_id: "Elevacion4258_5"
     coverage_crs: "EPSG:4258"
     bbox_pad_m: 50.0
+  # Valencia open-data overlays joined onto edges by spatial proximity:
+  #   kerb / kerb_type ← cartografia-base-vorades-bordillos
+  #   access_veh_a     ← vehiculos-movilidad-personal-tipo-a
+  # Both layers are ArcGIS REST polyline services (native EPSG:25830).
+  # Comment out the whole block to skip during `make initialize`.
+  valencia:
+    kerb_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/UrbanismoEInfraestructuras/MapServer/307"
+    type_a_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/Trafico/MapServer/2"
+    # Max distance (m) for an edge to pick up a kerb / lane feature.
+    kerb_tol_m: 4.0
+    lane_tol_m: 5.0
+
   # Accessibility cost model (alt_distance) — Option 2 from
   # docs/alt_distance_proposal.pdf:
   #   alt_distance = distance * exp(k_up*max(s,0) + k_down*max(-s,0))
@@ -40,3 +52,13 @@ initialize:
     # edges (5 m raster, sub-metre segments) can't push exp(k*s) to +inf.
     # 0.30 is well above any real accessible grade.
     slope_cap: 0.30
+    # Crossing-based kerb penalty (Option 5): alt_distance is multiplied by
+    # exp(k_kerb * min(kerb_cross, kerb_cross_cap)), where kerb_cross counts
+    # kerb lines the edge crosses. ln(10) ≈ 2.3026 makes each crossing cost one
+    # accessibility tier (×10); a two-kerb street crossing then costs ×100.
+    k_kerb: 2.302585092994046
+    # Clamp kerb_cross before the exponential. A real crossing traverses at most
+    # 2 curbs; higher counts are fragmented-kerb-layer artifacts on long/skewed
+    # edges, and uncapped they blow alt_distance up to ~1e18 (10^16), which
+    # makes pandana's contraction-hierarchy build pathologically slow.
+    kerb_cross_cap: 2

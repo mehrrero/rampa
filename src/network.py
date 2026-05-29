@@ -93,13 +93,17 @@ class Network:
             self.edges['to'] = self.edges['to'].astype('int64')
             self.edges['distance'] = self.edges['distance'].astype('float64')
             self.edges['alt_distance'] = self.edges['alt_distance'].astype('float64')
+            # `veh_a_distance` (type-A PMV metric) is optional — only present
+            # once the Valencia + accessibility steps have written it.
+            if 'veh_a_distance' in self.edges.columns:
+                self.edges['veh_a_distance'] = self.edges['veh_a_distance'].astype('float64')
         except Exception as e:
             logger.error("Error loading network from database: %s", e)
             return
 
-        # Build two parallel pandana networks over the same node/edge tables,
+        # Build parallel pandana networks over the same node/edge tables,
         # differing only in which weight column drives shortest-path. Keeping
-        # both materialised lets `route()` switch between them per call
+        # them all materialised lets `route()` switch between them per call
         # without rebuilding the graph.
         self.alt_network = pandana.Network(
             self.nodes['x'],
@@ -117,13 +121,52 @@ class Network:
             self.edges[['distance']],
         )
 
-    def route(self, coord1, coord2, alternate=False, max_snap_distance=500.0):
+        # Optional third network for the type-A PMV metric, when present.
+        self.veh_a_network = None
+        if 'veh_a_distance' in self.edges.columns:
+            self.veh_a_network = pandana.Network(
+                self.nodes['x'],
+                self.nodes['y'],
+                self.edges['from'],
+                self.edges['to'],
+                self.edges[['veh_a_distance']],
+            )
+
+    def _network_for(self, mode):
+        """Resolve a routing `mode` to its pandana network.
+
+        Modes: ``"distance"`` (raw length), ``"alt"`` (accessibility-weighted),
+        ``"veh_a"`` (type-A PMV). Raises ``ValueError`` for an unknown mode or
+        when ``"veh_a"`` is requested but the graph has no ``veh_a_distance``.
+        """
+        nets = {
+            "distance": self.network,
+            "alt": self.alt_network,
+            "veh_a": self.veh_a_network,
+        }
+        if mode not in nets:
+            raise ValueError(
+                f"unknown routing mode {mode!r}; expected one of {sorted(nets)}"
+            )
+        net = nets[mode]
+        if net is None:
+            raise ValueError(
+                f"routing mode {mode!r} unavailable: the graph has no "
+                "veh_a_distance column (run the Valencia + accessibility steps)."
+            )
+        return net
+
+    def route(self, coord1, coord2, mode="distance", alternate=False,
+              max_snap_distance=500.0):
         """Shortest-path node sequence between two points.
 
         Args:
             coord1, coord2: (x, y) in the same CRS as the network nodes
                 (currently EPSG:25830 / UTM 30N, meters).
-            alternate: use the accessibility-weighted network when True.
+            mode: which weighted network to route on — ``"distance"``,
+                ``"alt"`` (accessibility), or ``"veh_a"`` (type-A PMV).
+            alternate: deprecated boolean shim — ``True`` is equivalent to
+                ``mode="alt"``. Prefer ``mode``.
             max_snap_distance: if either input point is farther than this
                 (in CRS units) from the nearest network node, return None.
                 Set to None to disable the check.
@@ -132,12 +175,14 @@ class Network:
             Array of node ids along the shortest path, or None if either
             endpoint is too far from the network or no route exists.
         """
+        if alternate:
+            mode = "alt"
         x1, y1 = coord1
         x2, y2 = coord2
         xs = pd.Series([x1, x2])
         ys = pd.Series([y1, y2])
 
-        net = self.alt_network if alternate else self.network
+        net = self._network_for(mode)
         ids = net.get_node_ids(xs, ys)
 
         # Pandana's get_node_ids always snaps to the nearest node, even if it's
@@ -187,10 +232,12 @@ class Network:
 
 
 
-    def route_gdf(self, coord1, coord2, alternate=False, max_snap_distance=500.0):
+    def route_gdf(self, coord1, coord2, mode="distance", alternate=False,
+                  max_snap_distance=500.0):
         """GeoDataFrame of the route between two (x, y) points in the network's CRS."""
         pat = self.route(
             coord1, coord2,
+            mode=mode,
             alternate=alternate,
             max_snap_distance=max_snap_distance,
         )

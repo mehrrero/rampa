@@ -52,6 +52,14 @@ async def create_route(
     y1: float,
     x2: float,
     y2: float,
+    mode: str = Query(
+        "alt",
+        description=(
+            "Which accessibility route to return alongside the primary "
+            "(distance) route: 'alt' (accessibility-weighted) or 'veh_a' "
+            "(type-A personal-mobility-vehicle lanes)."
+        ),
+    ),
     max_snap_m: float = Query(
         500.0,
         description=(
@@ -61,20 +69,26 @@ async def create_route(
         ),
     ),
 ):
-    """Return the primary and accessibility-weighted routes between two points.
+    """Return the primary route plus one accessibility-weighted route.
 
     Args:
         x1, y1: Origin coordinate in the network's CRS
             (currently EPSG:25830 / UTM 30N, meters).
         x2, y2: Destination coordinate in the same CRS.
+        mode: Which secondary route to compute — ``"alt"`` (accessibility,
+            ``alt_distance``) or ``"veh_a"`` (type-A PMV lanes,
+            ``veh_a_distance``).
         max_snap_m: Snap-distance cutoff in meters; non-positive disables it.
 
     Returns:
-        dict: ``{"ruta": <GeoJSON>, "ruta_alt": <GeoJSON>}`` — the primary
-        route (weighted by distance) and the alternate route (weighted by
-        ``alt_distance``, which prefers accessible edges).
+        dict: ``{"ruta": <GeoJSON>, "ruta_alt"|"ruta_veh_a": <GeoJSON>,
+        "mode": <str>, "metadata": {...}}`` — the primary route (weighted by
+        distance) and the requested accessibility route, keyed by the selected
+        mode. Per-route metadata includes each route's total length in meters.
 
     Raises:
+        HTTPException(400): if ``mode`` is unknown, or ``"veh_a"`` is requested
+            but the graph has no ``veh_a_distance`` column.
         HTTPException(404): if either endpoint is farther than ``max_snap_m``
             from any node, or the endpoints are in disconnected components.
     """
@@ -82,8 +96,22 @@ async def create_route(
     coord2 = (x2, y2)
     snap = max_snap_m if max_snap_m > 0 else None
 
-    ruta = network.route_gdf(coord1, coord2, alternate=False, max_snap_distance=snap)
-    ruta_alt = network.route_gdf(coord1, coord2, alternate=True, max_snap_distance=snap)
+    if mode not in ("alt", "veh_a"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown mode {mode!r}; expected 'alt' or 'veh_a'.",
+        )
+    if mode == "veh_a" and network.veh_a_network is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "mode 'veh_a' unavailable: the graph has no veh_a_distance "
+                "column (run the Valencia + accessibility steps)."
+            ),
+        )
+
+    ruta = network.route_gdf(coord1, coord2, mode="distance", max_snap_distance=snap)
+    ruta_alt = network.route_gdf(coord1, coord2, mode=mode, max_snap_distance=snap)
 
     if ruta is None or ruta_alt is None:
         raise HTTPException(
@@ -96,8 +124,15 @@ async def create_route(
         )
 
     # `to_json` returns a string; round-trip through `loads` so FastAPI
-    # serialises a real JSON object rather than a stringified one.
+    # serialises a real JSON object rather than a stringified one. The
+    # secondary route is keyed by its mode (`ruta_alt` / `ruta_veh_a`).
+    alt_key = f"ruta_{mode}"
     return {
         "ruta": json.loads(ruta.to_json()),
-        "ruta_alt": json.loads(ruta_alt.to_json()),
+        alt_key: json.loads(ruta_alt.to_json()),
+        "mode": mode,
+        "metadata": {
+            "ruta": {"total_length": float(ruta["distance"].sum())},
+            alt_key: {"total_length": float(ruta_alt["distance"].sum())},
+        },
     }
