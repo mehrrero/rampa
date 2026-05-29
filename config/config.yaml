@@ -19,24 +19,28 @@ initialize:
     - width
   # Per-edge elevation derived from a DEM raster (PNOA-LiDAR MDT05 by default).
   # Comment out the whole block to skip elevation during `make initialize`.
-  elevation:
-    samples_per_edge: 8
-    # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
-    wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
-    coverage_id: "Elevacion4258_5"
-    coverage_crs: "EPSG:4258"
-    bbox_pad_m: 50.0
+  # NOTE: commented out — DEM download times out from this network. Re-enable
+  # when the IDEE WCS endpoint is reachable.
+  # elevation:
+  #   samples_per_edge: 8
+  #   # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
+  #   wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
+  #   coverage_id: "Elevacion4258_5"
+  #   coverage_crs: "EPSG:4258"
+  #   bbox_pad_m: 50.0
   # Valencia open-data overlays joined onto edges by spatial proximity:
   #   kerb / kerb_type ← cartografia-base-vorades-bordillos
   #   access_veh_a     ← vehiculos-movilidad-personal-tipo-a
   # Both layers are ArcGIS REST polyline services (native EPSG:25830).
   # Comment out the whole block to skip during `make initialize`.
-  valencia:
-    kerb_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/UrbanismoEInfraestructuras/MapServer/307"
-    type_a_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/Trafico/MapServer/2"
-    # Max distance (m) for an edge to pick up a kerb / lane feature.
-    kerb_tol_m: 4.0
-    lane_tol_m: 5.0
+  # NOTE: commented out for faster initialization in Railway deployment.
+  # Re-enable when building a full dataset.
+  # valencia:
+  #   kerb_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/UrbanismoEInfraestructuras/MapServer/307"
+  #   type_a_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/Trafico/MapServer/2"
+  #   # Max distance (m) for an edge to pick up a kerb / lane feature.
+  #   kerb_tol_m: 4.0
+  #   lane_tol_m: 5.0
 
   # Accessibility cost model (alt_distance) — Option 2 from
   # docs/alt_distance_proposal.pdf:

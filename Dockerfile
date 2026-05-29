@@ -38,6 +38,11 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-install-project --no-dev
 
+# boto3 for T3 (Tigris) bucket downloads on Railway startup — a deployment-only
+# dependency, kept out of pyproject/uv.lock.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install boto3
+
 # Application source only — the config folder and data/ are mounted at runtime.
 COPY src ./src
 COPY scripts ./scripts
@@ -57,4 +62,3 @@ VOLUME ["/app/config", "/app/data"]
 EXPOSE 8000
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
