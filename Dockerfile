@@ -35,13 +35,11 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 # edits don't bust the dependency layer. --no-install-project: the app isn't a
 # package to install, just a source tree we copy in below.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
 
 # boto3 for T3 (Tigris) bucket downloads on Railway startup — a deployment-only
 # dependency, kept out of pyproject/uv.lock.
-RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install boto3
+RUN uv pip install boto3
 
 # Application source only — the config folder and data/ are mounted at runtime.
 COPY src ./src
