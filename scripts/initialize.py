@@ -20,8 +20,8 @@ from shapely.geometry import LineString
 
 logger = logging.getLogger(__name__)
 
-# Default config path: project-root config.yaml (this file lives in scripts/).
-DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+# Default config path: project-root config/config.yaml (this file lives in scripts/).
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "config.yaml"
 
 
 #############################################
