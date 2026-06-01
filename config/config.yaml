@@ -19,15 +19,13 @@ initialize:
     - width
   # Per-edge elevation derived from a DEM raster (PNOA-LiDAR MDT05 by default).
   # Comment out the whole block to skip elevation during `make initialize`.
-  # NOTE: commented out — DEM download times out from this network. Re-enable
-  # when the IDEE WCS endpoint is reachable.
-  # elevation:
-  #   samples_per_edge: 8
-  #   # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
-  #   wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
-  #   coverage_id: "Elevacion4258_5"
-  #   coverage_crs: "EPSG:4258"
-  #   bbox_pad_m: 50.0
+  elevation:
+    samples_per_edge: 8
+    # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
+    wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
+    coverage_id: "Elevacion4258_5"
+    coverage_crs: "EPSG:4258"
+    bbox_pad_m: 50.0
   # Valencia open-data overlays joined onto edges by spatial proximity:
   #   kerb / kerb_type ← cartografia-base-vorades-bordillos
   #   access_veh_a     ← vehiculos-movilidad-personal-tipo-a
