@@ -41,6 +41,23 @@ app.add_middleware(
 network = Network(cfg["initialize"]["paths"]["db_path"])
 
 
+def _route_metadata(ruta) -> dict:
+    """Per-route summary: total length plus total ascent/descent in metres.
+
+    Ascent/descent are derived from the per-edge ``d_elev`` (signed climb,
+    ``z_to - z_from``, already oriented in travel direction). They are only
+    included when the elevation step has populated ``d_elev``; NaN edges (no
+    geometry / all-nodata DEM samples) are dropped so a single gap doesn't
+    void the whole total.
+    """
+    meta = {"total_length": float(ruta["distance"].sum())}
+    if "d_elev" in ruta.columns:
+        d_elev = ruta["d_elev"].dropna()
+        meta["total_ascent"] = float(d_elev[d_elev > 0].sum())
+        meta["total_descent"] = float(-d_elev[d_elev < 0].sum())
+    return meta
+
+
 @app.get("/health")
 async def healthcheck():
     return {"status": "ok"}
@@ -84,7 +101,9 @@ async def create_route(
         dict: ``{"ruta": <GeoJSON>, "ruta_alt"|"ruta_veh_a": <GeoJSON>,
         "mode": <str>, "metadata": {...}}`` — the primary route (weighted by
         distance) and the requested accessibility route, keyed by the selected
-        mode. Per-route metadata includes each route's total length in meters.
+        mode. Per-route metadata includes each route's total length in meters,
+        and — when elevation data is present — its total ascent and descent in
+        meters.
 
     Raises:
         HTTPException(400): if ``mode`` is unknown, or ``"veh_a"`` is requested
@@ -132,7 +151,7 @@ async def create_route(
         alt_key: json.loads(ruta_alt.to_json()),
         "mode": mode,
         "metadata": {
-            "ruta": {"total_length": float(ruta["distance"].sum())},
-            alt_key: {"total_length": float(ruta_alt["distance"].sum())},
+            "ruta": _route_metadata(ruta),
+            alt_key: _route_metadata(ruta_alt),
         },
     }
