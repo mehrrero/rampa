@@ -134,15 +134,30 @@ PMV lanes instead of general accessibility (returned under `ruta_veh_a`).
   "city": "valencia",
   "mode": "alt",
   "metadata": {
-    "ruta": { "total_length": 1250.7 },
-    "ruta_alt": { "total_length": 1342.3 }
+    "ruta": {
+      "total_length": 1250.7,
+      "walking_time": "16 min",
+      "wheelchair_time": "29 min",
+      "total_ascent": 18.4,
+      "total_descent": 12.1
+    },
+    "ruta_alt": {
+      "total_length": 1342.3,
+      "walking_time": "18 min",
+      "wheelchair_time": "31 min",
+      "total_ascent": 9.2,
+      "total_descent": 2.9
+    }
   }
 }
 ```
 
 - **`ruta`** — shortest path by raw distance (GeoJSON FeatureCollection).
 - **`ruta_alt`** or **`ruta_veh_a`** — shortest path weighted by the accessibility model (key depends on `mode`).
-- **`metadata`** — per-route total length in meters.
+- **`metadata`** — per-route summary:
+  - `total_length` — route length in meters.
+  - `walking_time` / `wheelchair_time` — estimated traversal time, derived from `total_length` at the speeds configured under `api.travel_speeds` (defaults: 1.24 m/s walking, 0.7 m/s wheelchair). Formatted as `"X h Y min"`, or `"Y min"` when under an hour.
+  - `total_ascent` / `total_descent` — cumulative climb / drop in meters (present only when elevation data is available).
 
 Each feature in the GeoJSON `FeatureCollection` represents a sidewalk edge with the following `properties`:
 
@@ -193,6 +208,8 @@ const data = await res.json();
 // data.ruta              — primary route (GeoJSON FeatureCollection)
 // data.ruta_alt          — accessibility route (GeoJSON FeatureCollection)
 // data.metadata.ruta.total_length         — primary route length (meters)
+// data.metadata.ruta.walking_time         — primary route walking time ("X h Y min")
+// data.metadata.ruta.wheelchair_time      — primary route wheelchair time ("X h Y min")
 // data.metadata.ruta_alt.total_length     — accessibility route length (meters)
 ```
 
@@ -206,7 +223,16 @@ interface RouteResponse {
   ruta: FeatureCollection;
   ruta_alt: FeatureCollection;
   mode: "alt" | "veh_a";
-  metadata: Record<string, { total_length: number }>;
+  metadata: Record<
+    string,
+    {
+      total_length: number;
+      walking_time: string;
+      wheelchair_time: string;
+      total_ascent?: number;
+      total_descent?: number;
+    }
+  >;
 }
 
 function RouteMap() {
@@ -306,6 +332,11 @@ initialize:
     slope_cap: 0.30
     k_kerb: 2.302585092994046
     kerb_cross_cap: 2
+
+api:
+  travel_speeds:                         # m/s, used for route time estimates
+    walking: 1.24
+    wheelchair: 0.7
 ```
 
 Add more entries under `cities` to build several cities into the same DuckDB;

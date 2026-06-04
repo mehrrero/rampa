@@ -61,6 +61,21 @@ def _network_for_city(city: str) -> Network:
     return net
 
 
+# Travel speeds (m/s) used to estimate traversal time per route.
+TRAVEL_SPEEDS_MS = cfg["api"]["travel_speeds"]
+WALKING_SPEED_MS = TRAVEL_SPEEDS_MS["walking"]
+WHEELCHAIR_SPEED_MS = TRAVEL_SPEEDS_MS["wheelchair"]
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration as ``"X h Y min"``, or ``"Y min"`` when X is 0."""
+    total_minutes = round(seconds / 60)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{minutes} min"
+
+
 def _route_metadata(ruta) -> dict:
     """Per-route summary: total length plus total ascent/descent in metres.
 
@@ -69,8 +84,16 @@ def _route_metadata(ruta) -> dict:
     included when the elevation step has populated ``d_elev``; NaN edges (no
     geometry / all-nodata DEM samples) are dropped so a single gap doesn't
     void the whole total.
+
+    Traversal time is estimated from the total length at fixed walking and
+    wheelchair speeds, formatted as ``"X h Y min"`` (or ``"Y min"``).
     """
-    meta = {"total_length": float(ruta["distance"].sum())}
+    total_length = float(ruta["distance"].sum())
+    meta = {
+        "total_length": total_length,
+        "walking_time": _format_duration(total_length / WALKING_SPEED_MS),
+        "wheelchair_time": _format_duration(total_length / WHEELCHAIR_SPEED_MS),
+    }
     if "d_elev" in ruta.columns:
         d_elev = ruta["d_elev"].dropna()
         meta["total_ascent"] = float(d_elev[d_elev > 0].sum())
@@ -151,8 +174,8 @@ async def create_route(
         "mode": <str>, "metadata": {...}}`` — the primary route (weighted by
         distance) and the requested accessibility route, keyed by the selected
         mode. Per-route metadata includes each route's total length in meters,
-        and — when elevation data is present — its total ascent and descent in
-        meters.
+        estimated walking and wheelchair traversal times, and — when elevation
+        data is present — its total ascent and descent in meters.
 
     Raises:
         HTTPException(400): if ``mode`` is unknown, or ``"veh_a"`` is requested

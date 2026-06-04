@@ -90,3 +90,11 @@ initialize:
     # edges, and uncapped they blow alt_distance up to ~1e18 (10^16), which
     # makes pandana's contraction-hierarchy build pathologically slow.
     kerb_cross_cap: 2
+
+# Used by src/api.py
+api:
+  # Traversal speeds (m/s) used to estimate each route's travel time from its
+  # total length. Reported in the per-route metadata as "X h Y min".
+  travel_speeds:
+    walking: 1.24
+    wheelchair: 0.7
