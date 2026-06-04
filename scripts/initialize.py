@@ -18,6 +18,8 @@ import pandas as pd
 import yaml
 from shapely.geometry import LineString
 
+from src.tables import city_tables, slugify_city
+
 logger = logging.getLogger(__name__)
 
 # Default config path: project-root config/config.yaml (this file lives in scripts/).
@@ -41,13 +43,16 @@ def load_graph(
     graph_path: str | Path,
     db_path: str | Path,
     attributes: list[str] | None = None,
+    nodes_table: str = "nodes",
+    edges_table: str = "edges",
 ) -> None:
     """Read a pickled (tile2net-style) graph and write nodes/edges to DuckDB.
 
     The output schema mirrors what `Network.__get_network` expects on reload:
     `nodes(index, x, y)` and `edges(from, to, distance, alt_distance, ...)`.
     Any names in `attributes` are copied from the edge data dict onto the
-    edges table (e.g. ``width``).
+    edges table (e.g. ``width``). ``nodes_table`` / ``edges_table`` select the
+    destination tables — per-city builds pass ``nodes_<city>`` / ``edges_<city>``.
     """
     attributes = list(attributes or [])
     graph_path = Path(graph_path)
@@ -121,10 +126,11 @@ def load_graph(
         # which is what __get_network's set_index('index') expects.
         con.register("df_nodes", nodes.reset_index(drop=False))
         con.register("df_edges", edges)
-        con.execute("CREATE OR REPLACE TABLE nodes AS SELECT * FROM df_nodes")
-        con.execute("CREATE OR REPLACE TABLE edges AS SELECT * FROM df_edges")
+        con.execute(f'CREATE OR REPLACE TABLE "{nodes_table}" AS SELECT * FROM df_nodes')
+        con.execute(f'CREATE OR REPLACE TABLE "{edges_table}" AS SELECT * FROM df_edges')
         logger.info(
-            "Stored %d nodes and %d edges → %s", len(nodes), len(edges), db_path
+            "Stored %d nodes (%s) and %d edges (%s) → %s",
+            len(nodes), nodes_table, len(edges), edges_table, db_path,
         )
     finally:
         con.close()
@@ -330,6 +336,7 @@ def compute_elevation(
     dem_path: str | Path,
     crs: str,
     samples_per_edge: int = 8,
+    edges_table: str = "edges",
 ) -> None:
     """Sample a DEM raster along each edge and write elevation columns.
 
@@ -381,9 +388,11 @@ def compute_elevation(
         # Add the six elevation columns if they're not already there. This
         # makes the function idempotent — re-running just overwrites values.
         for col in elev_cols:
-            con.execute(f"ALTER TABLE edges ADD COLUMN IF NOT EXISTS {col} DOUBLE")
+            con.execute(
+                f'ALTER TABLE "{edges_table}" ADD COLUMN IF NOT EXISTS {col} DOUBLE'
+            )
 
-        edges = con.execute("SELECT * FROM edges").fetchdf()
+        edges = con.execute(f'SELECT * FROM "{edges_table}"').fetchdf()
         logger.info("Loaded %d edges into memory for sampling", len(edges))
 
         # ─── 2. open the raster, set up CRS reprojection if needed ──────────
@@ -482,7 +491,7 @@ def compute_elevation(
         # CREATE OR REPLACE swaps the table in a single transaction so the
         # API never sees a half-written edges table mid-run.
         con.register("df_edges", edges)
-        con.execute("CREATE OR REPLACE TABLE edges AS SELECT * FROM df_edges")
+        con.execute(f'CREATE OR REPLACE TABLE "{edges_table}" AS SELECT * FROM df_edges')
 
         # Quick sanity summary so the operator can spot empty rasters early.
         finite = edges["z_from"].notna().sum()
@@ -593,24 +602,26 @@ def _fetch_arcgis_polylines(
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
 
 
-def compute_valencia_features(
+def compute_overlay_features(
     db_path: str | Path,
     crs: str,
-    kerb_url: str,
-    type_a_url: str,
+    kerb_url: str | None = None,
+    type_a_url: str | None = None,
     kerb_tol_m: float = 4.0,
     lane_tol_m: float = 5.0,
     timeout: float = 180.0,
+    nodes_table: str = "nodes",
+    edges_table: str = "edges",
 ) -> None:
-    """Attach Valencia open-data overlays to the edges table.
+    """Attach an open-data overlay (kerbs + type-A PMV lanes) to an edges table.
 
-    Pulls two polyline layers from the Valencia geoportal (both native
-    EPSG:25830, the project CRS) and joins them onto each edge by spatial
-    proximity, writing three columns:
+    Pulls two ArcGIS REST polyline layers (assumed native to the project CRS)
+    and joins them onto each edge by spatial proximity, writing columns:
 
         kerb         (BOOLEAN) — a kerb line runs within `kerb_tol_m`
         kerb_type    (VARCHAR) — `elemento` of the nearest kerb
                                  (BORDILLO / BORDILLO JARDINERO / ACERA BORDILLO)
+        kerb_cross   (INTEGER) — number of kerb lines the edge crosses
         access_veh_a (BOOLEAN) — edge lies within `lane_tol_m` of a lane where
                                  type-A personal-mobility vehicles may circulate
 
@@ -622,22 +633,28 @@ def compute_valencia_features(
     the `nodes` table and padded by the join tolerance) to keep the download
     small. The join uses `sjoin_nearest` with a `max_distance` cutoff, so an
     edge with no overlay feature within tolerance simply gets False / NULL.
-    Edges lacking a stored geometry are left as False / NULL too. The function
-    is idempotent — it rewrites the edges table atomically via CREATE OR
-    REPLACE.
+
+    Each layer is handled independently and degrades gracefully: if its URL is
+    omitted (``None``) or the fetch fails, the build does not abort. For kerbs
+    that means every edge is treated as a *flat* kerb (no type, zero crossings),
+    so the accessibility step adds no kerb penalty. For type-A lanes the
+    ``access_veh_a`` column is simply not written, which leaves
+    ``compute_accesibility_distance`` to fall back to ``veh_a_distance =
+    alt_distance``. The function is idempotent — it rewrites the edges table
+    atomically via CREATE OR REPLACE.
     """
     import geopandas as gpd
     from shapely import wkb
 
     con = duckdb.connect(str(db_path))
     try:
-        edges = con.execute("SELECT * FROM edges").fetchdf()
-        logger.info("Loaded %d edges for Valencia overlay join", len(edges))
+        edges = con.execute(f'SELECT * FROM "{edges_table}"').fetchdf()
+        logger.info("Loaded %d edges (%s) for overlay join", len(edges), edges_table)
 
         # ─── 1. graph bbox (padded by the join tolerance) for server-side
         #         filtering, so we don't download the whole city. ────────────
         xmin, ymin, xmax, ymax = con.execute(
-            "SELECT min(x), min(y), max(x), max(y) FROM nodes"
+            f'SELECT min(x), min(y), max(x), max(y) FROM "{nodes_table}"'
         ).fetchone()
         pad = max(kerb_tol_m, lane_tol_m) + 5.0
         bbox = (xmin - pad, ymin - pad, xmax + pad, ymax + pad)
@@ -654,21 +671,38 @@ def compute_valencia_features(
         )
         e = e[e.geometry.notna()].copy()
 
-        # ─── 3. fetch the three overlays within the bbox ────────────────────
-        kerbs = _fetch_arcgis_polylines(
-            kerb_url, crs, bbox=bbox, out_fields="elemento", timeout=timeout
-        )
-        lanes_a = _fetch_arcgis_polylines(
-            type_a_url, crs, bbox=bbox, out_fields="gid", timeout=timeout
-        )
-        logger.info(
-            "Fetched overlays in bbox: %d kerbs, %d type-A lanes",
-            len(kerbs), len(lanes_a),
-        )
+        # ─── 3. fetch each overlay within the bbox, independently ───────────
+        # A missing URL or a fetch failure returns None and triggers the
+        # fallback for that layer instead of aborting the whole city build.
+        def _try_fetch(url: str | None, label: str, out_fields: str):
+            if not url:
+                logger.info("No %s URL for %s — using fallback.", label, edges_table)
+                return None
+            try:
+                layer = _fetch_arcgis_polylines(
+                    url, crs, bbox=bbox, out_fields=out_fields, timeout=timeout
+                )
+                logger.info("Fetched %d %s features in bbox", len(layer), label)
+                return layer
+            except Exception as ex:  # noqa: BLE001 — any fetch/parse error → fallback
+                logger.warning(
+                    "%s overlay fetch failed (%s) — using fallback.", label, ex
+                )
+                return None
 
-        # ─── 4. kerbs: nearest kerb within tolerance → type + boolean ───────
+        kerbs = _try_fetch(kerb_url, "kerb", "elemento")
+        lanes_a = _try_fetch(type_a_url, "type-A lane", "gid")
+
+        # ─── 4. kerbs → type, boolean, and crossing count ───────────────────
+        # Kerb *crossings* are the accessibility-relevant signal — a curb the
+        # route must mount (transversal), as opposed to a kerb it merely runs
+        # parallel to. A full street crossing typically scores 2; along-
+        # sidewalk travel scores 0. With no kerb data every edge is a flat kerb
+        # (no type, zero crossings) → the accessibility step adds no penalty.
         edges["kerb_type"] = None
-        if not kerbs.empty:
+        edges["kerb"] = False
+        edges["kerb_cross"] = 0
+        if kerbs is not None and not kerbs.empty:
             j = gpd.sjoin_nearest(
                 e, kerbs[["elemento", "geometry"]],
                 how="inner", max_distance=kerb_tol_m, distance_col="_d",
@@ -676,23 +710,18 @@ def compute_valencia_features(
             # An edge can tie to several kerb lines; keep the closest one.
             j = j.sort_values("_d").drop_duplicates("_pos")
             edges["kerb_type"] = edges.index.map(dict(zip(j["_pos"], j["elemento"])))
-        edges["kerb"] = edges["kerb_type"].notna()
+            edges["kerb"] = edges["kerb_type"].notna()
 
-        # Kerb *crossings*: the number of kerb lines the edge geometrically
-        # crosses (transversal), as opposed to running parallel to one. This
-        # is the accessibility-relevant signal — a curb the route must mount —
-        # whereas the near-uniform parallel boundary (the `kerb` flag above)
-        # is not a barrier. A full street crossing typically scores 2 (one
-        # kerb on each side); along-sidewalk travel scores 0.
-        edges["kerb_cross"] = 0
-        if not kerbs.empty:
             jc = gpd.sjoin(e, kerbs[["geometry"]], how="inner", predicate="crosses")
             counts = jc.groupby("_pos").size()
             edges["kerb_cross"] = (
                 counts.reindex(edges.index, fill_value=0).astype("int64").to_numpy()
             )
 
-        # ─── 5. vehicle lanes: presence within tolerance → boolean ──────────
+        # ─── 5. type-A PMV lanes: presence within tolerance → boolean ───────
+        # Written only when real lane data is available; otherwise the column
+        # is left off entirely so compute_accesibility_distance falls back to
+        # veh_a_distance = alt_distance.
         def _near(layer) -> set[int]:
             if layer.empty:
                 return set()
@@ -701,17 +730,21 @@ def compute_valencia_features(
             )
             return set(j["_pos"].tolist())
 
-        edges["access_veh_a"] = edges.index.isin(_near(lanes_a))
+        has_lane_data = lanes_a is not None
+        if has_lane_data:
+            edges["access_veh_a"] = edges.index.isin(_near(lanes_a))
 
         # ─── 6. write the enriched edges back atomically ────────────────────
         con.register("df_edges", edges)
-        con.execute("CREATE OR REPLACE TABLE edges AS SELECT * FROM df_edges")
+        con.execute(f'CREATE OR REPLACE TABLE "{edges_table}" AS SELECT * FROM df_edges')
         logger.info(
-            "Valencia features written: kerb=%d, kerb_cross>0=%d, access_veh_a=%d "
-            "(of %d edges)",
+            "Overlay features written for %s: kerb=%d, kerb_cross>0=%d, "
+            "access_veh_a=%s (of %d edges)",
+            edges_table,
             int(edges["kerb"].sum()),
             int((edges["kerb_cross"] > 0).sum()),
-            int(edges["access_veh_a"].sum()),
+            int(edges["access_veh_a"].sum()) if has_lane_data
+            else "n/a (→ veh_a_distance = alt_distance)",
             len(edges),
         )
     finally:
@@ -727,6 +760,7 @@ def compute_accesibility_distance(
     slope_cap: float = 0.30,
     k_kerb: float = math.log(10),
     kerb_cross_cap: int = 2,
+    edges_table: str = "edges",
 ) -> None:
     """Compute `accesibility` and `alt_distance` on the edges table.
 
@@ -749,7 +783,7 @@ def compute_accesibility_distance(
 
         C ← C · exp(k_kerb · kerb_cross)
 
-    where ``kerb_cross`` (written by ``compute_valencia_features``) counts the
+    where ``kerb_cross`` (written by ``compute_overlay_features``) counts the
     kerb lines the edge actually crosses — curbs the route must mount. With the
     CTE-anchored default ``k_kerb = ln(10)``, each crossing multiplies the cost
     by 10 (one accessibility tier), so a typical two-kerb street crossing costs
@@ -783,13 +817,13 @@ def compute_accesibility_distance(
     con = duckdb.connect(str(db_path))
     try:
         # Idempotent so the function can be re-run.
-        con.execute("ALTER TABLE edges ADD COLUMN IF NOT EXISTS accesibility INTEGER")
-        con.execute("ALTER TABLE edges ADD COLUMN IF NOT EXISTS alt_distance DOUBLE")
+        con.execute(f'ALTER TABLE "{edges_table}" ADD COLUMN IF NOT EXISTS accesibility INTEGER')
+        con.execute(f'ALTER TABLE "{edges_table}" ADD COLUMN IF NOT EXISTS alt_distance DOUBLE')
 
         # COALESCE so missing widths score as inaccessible instead of NULL.
         con.execute(
             f"""
-            UPDATE edges
+            UPDATE "{edges_table}"
             SET accesibility = CASE
                 WHEN COALESCE("{col}", 0) >= {threshold} THEN 1
                 ELSE 0
@@ -802,7 +836,7 @@ def compute_accesibility_distance(
         # usable alt_distance.
         has_slope = bool(con.execute(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'edges' AND column_name = 'slope'"
+            f"WHERE table_name = '{edges_table}' AND column_name = 'slope'"
         ).fetchone())
 
         if has_slope:
@@ -811,7 +845,7 @@ def compute_accesibility_distance(
             # can't overflow exp(k*s) to +inf.
             con.execute(
                 f"""
-                UPDATE edges
+                UPDATE "{edges_table}"
                 SET alt_distance = distance
                     * EXP({k_up}   * GREATEST(LEAST( COALESCE(slope, 0.0),  {slope_cap}), 0.0)
                         + {k_down} * GREATEST(LEAST(-COALESCE(slope, 0.0),  {slope_cap}), 0.0))
@@ -824,7 +858,7 @@ def compute_accesibility_distance(
                 "alt_distance falls back to distance / 10^accesibility."
             )
             con.execute(
-                "UPDATE edges SET alt_distance = distance / POWER(10, accesibility)"
+                f'UPDATE "{edges_table}" SET alt_distance = distance / POWER(10, accesibility)'
             )
 
         # Crossing-based kerb penalty (Option 5): fold in a multiplicative
@@ -832,11 +866,11 @@ def compute_accesibility_distance(
         # step never ran and the column is absent.
         has_kerb = bool(con.execute(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'edges' AND column_name = 'kerb_cross'"
+            f"WHERE table_name = '{edges_table}' AND column_name = 'kerb_cross'"
         ).fetchone())
         if has_kerb:
             con.execute(
-                f"UPDATE edges SET alt_distance = alt_distance "
+                f'UPDATE "{edges_table}" SET alt_distance = alt_distance '
                 f"* EXP({k_kerb} * LEAST(COALESCE(kerb_cross, 0), {kerb_cross_cap}))"
             )
 
@@ -846,25 +880,34 @@ def compute_accesibility_distance(
         # — divide out the width gate, divide in the vehicle gate — so the
         # slope/kerb terms can never drift between the two metrics. An edge on a
         # type-A lane is 10× cheaper; off-lane edges pay full.
+        #
+        # When no type-A lane data is available (no `access_veh_a` column —
+        # because the overlay URL was omitted or its fetch failed),
+        # veh_a_distance simply mirrors alt_distance, so type-A routing degrades
+        # to the general accessibility route rather than disappearing.
         has_veh_a = bool(con.execute(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'edges' AND column_name = 'access_veh_a'"
+            f"WHERE table_name = '{edges_table}' AND column_name = 'access_veh_a'"
         ).fetchone())
+        con.execute(f'ALTER TABLE "{edges_table}" ADD COLUMN IF NOT EXISTS veh_a_distance DOUBLE')
         if has_veh_a:
-            con.execute("ALTER TABLE edges ADD COLUMN IF NOT EXISTS veh_a_distance DOUBLE")
             con.execute(
-                "UPDATE edges SET veh_a_distance = alt_distance "
+                f'UPDATE "{edges_table}" SET veh_a_distance = alt_distance '
                 "* POWER(10, accesibility) "
                 "/ POWER(10, CASE WHEN COALESCE(access_veh_a, FALSE) THEN 1 ELSE 0 END)"
             )
+        else:
+            con.execute(
+                f'UPDATE "{edges_table}" SET veh_a_distance = alt_distance'
+            )
 
         accessible, total = con.execute(
-            "SELECT SUM(accesibility), COUNT(*) FROM edges"
+            f'SELECT SUM(accesibility), COUNT(*) FROM "{edges_table}"'
         ).fetchone()
         if has_kerb:
             n_pen, max_x = con.execute(
                 "SELECT COUNT(*) FILTER (WHERE COALESCE(kerb_cross, 0) > 0), "
-                "MAX(kerb_cross) FROM edges"
+                f'MAX(kerb_cross) FROM "{edges_table}"'
             ).fetchone()
             logger.info(
                 "Kerb crossing penalty (k_kerb=%.3f, cap=%d) applied to %d edges "
@@ -877,7 +920,7 @@ def compute_accesibility_distance(
                 "SELECT AVG(alt_distance / distance), "
                 "       quantile_cont(alt_distance / distance, 0.5), "
                 "       MAX(alt_distance / distance) "
-                "FROM edges WHERE distance > 0"
+                f'FROM "{edges_table}" WHERE distance > 0'
             ).fetchone()
             logger.info(
                 "Accessibility on %s: %d/%d edges accessible "
@@ -896,12 +939,17 @@ def compute_accesibility_distance(
             on_lane, veh_mean = con.execute(
                 "SELECT SUM(CAST(COALESCE(access_veh_a, FALSE) AS INTEGER)), "
                 "       AVG(veh_a_distance / distance) "
-                "FROM edges WHERE distance > 0"
+                f'FROM "{edges_table}" WHERE distance > 0'
             ).fetchone()
             logger.info(
                 "Type-A metric (veh_a_distance) written: %d/%d edges on a type-A "
                 "lane; veh_a_distance/distance mean=%.3f",
                 on_lane, total, veh_mean,
+            )
+        else:
+            logger.info(
+                "No type-A lane data on %s — veh_a_distance mirrors alt_distance.",
+                db_path,
             )
     finally:
         con.close()
@@ -921,62 +969,111 @@ if __name__ == "__main__":
 
     cfg = load_config(DEFAULT_CONFIG_PATH)
     section = cfg["initialize"]
-    paths_cfg = section["paths"]
-    crs = cfg.get("crs", "EPSG:25829")
+    db_path = section["paths"]["db_path"]
+    default_crs = cfg.get("crs", "EPSG:25830")
+    attributes = section.get("attributes") or []
 
-    load_graph(
-        graph_path=paths_cfg["graph_path"],
-        db_path=paths_cfg["db_path"],
-        attributes=section.get("attributes") or [],
-    )
+    # DEM rasters are fetched automatically and cached next to the database,
+    # one per city, named `mdt_<city>.tif`.
+    dem_dir = Path(db_path).parent
 
-    # Elevation step — only runs if the `elevation` block exists in config.
+    # Steps below the graph load share their config across all cities; only
+    # paths (graph/DEM) and the open-data overlay are per-city.
     elev_cfg = section.get("elevation")
-    if elev_cfg:
-        # Pull the graph bbox from the nodes table we just wrote.
-        with duckdb.connect(str(paths_cfg["db_path"])) as con:
-            bbox = con.execute(
-                "SELECT min(x), min(y), max(x), max(y) FROM nodes"
-            ).fetchone()
-
-        fetch_dem(
-            out_path=paths_cfg["dem_path"],
-            bbox=bbox,
-            bbox_crs=crs,
-            wcs_url=elev_cfg.get("wcs_url", "https://servicios.idee.es/wcs-inspire/mdt"),
-            coverage_id=elev_cfg.get("coverage_id", "Elevacion4258_5"),
-            coverage_crs=elev_cfg.get("coverage_crs", "EPSG:4258"),
-            pad_m=elev_cfg.get("bbox_pad_m", 50.0),
-        )
-        compute_elevation(
-            db_path=paths_cfg["db_path"],
-            dem_path=paths_cfg["dem_path"],
-            crs=crs,
-            samples_per_edge=elev_cfg.get("samples_per_edge", 8),
-        )
-
-    # Valencia open-data overlays (kerbs + PMV-accessible lanes) — only runs
-    # if the `valencia` block exists in config.
-    val_cfg = section.get("valencia")
-    if val_cfg:
-        compute_valencia_features(
-            db_path=paths_cfg["db_path"],
-            crs=crs,
-            kerb_url=val_cfg["kerb_url"],
-            type_a_url=val_cfg["type_a_url"],
-            kerb_tol_m=val_cfg.get("kerb_tol_m", 4.0),
-            lane_tol_m=val_cfg.get("lane_tol_m", 5.0),
-            timeout=val_cfg.get("timeout", 180.0),
-        )
-
     acc_cfg = section.get("accessibility") or {}
-    compute_accesibility_distance(
-        db_path=paths_cfg["db_path"],
-        attributes=section.get("attributes") or [],
-        threshold=acc_cfg.get("width_threshold", 1.50),
-        k_up=acc_cfg.get("k_up", 38.0),
-        k_down=acc_cfg.get("k_down", 23.0),
-        slope_cap=acc_cfg.get("slope_cap", 0.30),
-        k_kerb=acc_cfg.get("k_kerb", math.log(10)),
-        kerb_cross_cap=acc_cfg.get("kerb_cross_cap", 2),
-    )
+
+    cities = section.get("cities") or []
+    if not cities:
+        raise SystemExit(
+            "config initialize.cities is empty — nothing to build. "
+            "Add at least one city with name/graph_path/dem_path."
+        )
+
+    for city in cities:
+        name = city["name"]
+        nodes_table, edges_table = city_tables(name)
+        # Per-city CRS overrides the top-level default; the auto-fetched DEM is
+        # cached as data/mdt_<city>.tif (alongside the database).
+        crs = city.get("crs", default_crs)
+        dem_path = dem_dir / f"mdt_{slugify_city(name)}.tif"
+        logger.info(
+            "=== Building city %r (crs=%s) → %s / %s ===",
+            name, crs, nodes_table, edges_table,
+        )
+
+        load_graph(
+            graph_path=city["graph_path"],
+            db_path=db_path,
+            attributes=attributes,
+            nodes_table=nodes_table,
+            edges_table=edges_table,
+        )
+
+        # A failed/empty pickle load leaves no tables behind; skip the rest of
+        # this city's steps (they'd error on the missing table) but keep going
+        # so one bad source graph doesn't abort the whole multi-city run.
+        with duckdb.connect(str(db_path)) as con:
+            built = bool(con.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                [nodes_table],
+            ).fetchone())
+        if not built:
+            logger.error(
+                "Skipping city %r — graph load produced no %s table.",
+                name, nodes_table,
+            )
+            continue
+
+        # Elevation step — shared params, per-city DEM raster. Only runs if the
+        # `elevation` block exists in config.
+        if elev_cfg:
+            # Pull the graph bbox from the nodes table we just wrote.
+            with duckdb.connect(str(db_path)) as con:
+                bbox = con.execute(
+                    f'SELECT min(x), min(y), max(x), max(y) FROM "{nodes_table}"'
+                ).fetchone()
+
+            fetch_dem(
+                out_path=dem_path,
+                bbox=bbox,
+                bbox_crs=crs,
+                wcs_url=elev_cfg.get("wcs_url", "https://servicios.idee.es/wcs-inspire/mdt"),
+                coverage_id=elev_cfg.get("coverage_id", "Elevacion4258_5"),
+                coverage_crs=elev_cfg.get("coverage_crs", "EPSG:4258"),
+                pad_m=elev_cfg.get("bbox_pad_m", 50.0),
+            )
+            compute_elevation(
+                db_path=db_path,
+                dem_path=dem_path,
+                crs=crs,
+                samples_per_edge=elev_cfg.get("samples_per_edge", 8),
+                edges_table=edges_table,
+            )
+
+        # Open-data overlay (kerbs + PMV-accessible lanes) — per-city and
+        # optional. Only runs if this city has an `overlay` block.
+        ov_cfg = city.get("overlay")
+        if ov_cfg:
+            compute_overlay_features(
+                db_path=db_path,
+                crs=crs,
+                kerb_url=ov_cfg.get("kerb_url"),
+                type_a_url=ov_cfg.get("type_a_url"),
+                kerb_tol_m=ov_cfg.get("kerb_tol_m", 4.0),
+                lane_tol_m=ov_cfg.get("lane_tol_m", 5.0),
+                timeout=ov_cfg.get("timeout", 180.0),
+                nodes_table=nodes_table,
+                edges_table=edges_table,
+            )
+
+        compute_accesibility_distance(
+            db_path=db_path,
+            attributes=attributes,
+            threshold=acc_cfg.get("width_threshold", 1.50),
+            k_up=acc_cfg.get("k_up", 38.0),
+            k_down=acc_cfg.get("k_down", 23.0),
+            slope_cap=acc_cfg.get("slope_cap", 0.30),
+            k_kerb=acc_cfg.get("k_kerb", math.log(10)),
+            kerb_cross_cap=acc_cfg.get("kerb_cross_cap", 2),
+            edges_table=edges_table,
+        )

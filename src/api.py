@@ -38,7 +38,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-network = Network(cfg["initialize"]["paths"]["db_path"])
+DB_PATH = cfg["initialize"]["paths"]["db_path"]
+CITY_NAMES = [c["name"] for c in cfg["initialize"].get("cities", [])]
+
+# One Network per configured city, built eagerly at import. Each reads its own
+# `nodes_<city>` / `edges_<city>` tables produced by scripts/initialize.py.
+# The first city in config is the default when a request omits `city`.
+networks: dict[str, Network] = {
+    name: Network(DB_PATH, city=name) for name in CITY_NAMES
+}
+DEFAULT_CITY = CITY_NAMES[0] if CITY_NAMES else None
+
+
+def _network_for_city(city: str) -> Network:
+    """Resolve a `city` query value to its Network, or raise HTTP 404."""
+    net = networks.get(city)
+    if net is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown city {city!r}; available: {sorted(networks)}",
+        )
+    return net
 
 
 def _route_metadata(ruta) -> dict:
@@ -63,12 +83,26 @@ async def healthcheck():
     return {"status": "ok"}
 
 
+@app.get("/cities")
+async def list_cities():
+    """Available city networks and the default used when `city` is omitted."""
+    return {"cities": sorted(networks), "default": DEFAULT_CITY}
+
+
 @app.get("/ruta")
 async def create_route(
     x1: float,
     y1: float,
     x2: float,
     y2: float,
+    city: str = Query(
+        DEFAULT_CITY,
+        description=(
+            "Which city's network to route on. Defaults to the first city in "
+            "config; see GET /cities for the available names."
+        ),
+        examples=["valencia", "madrid"],
+    ),
     mode: str = Query(
         "alt",
         description=(
@@ -88,10 +122,25 @@ async def create_route(
 ):
     """Return the primary route plus one accessibility-weighted route.
 
+    Coordinates are in the network CRS (EPSG:25830 / UTM 30N, meters), so they
+    differ per city. Example queries:
+
+    - Valencia (default city)::
+
+        GET /ruta?city=valencia&x1=726538.273048&y1=4369685.099138
+                 &x2=725471.941018&y2=4371464.411097
+
+    - Madrid::
+
+        GET /ruta?city=madrid&x1=441936.50143&y1=4474738.053088
+                 &x2=438726.727451&y2=4474983.775073
+
     Args:
         x1, y1: Origin coordinate in the network's CRS
             (currently EPSG:25830 / UTM 30N, meters).
         x2, y2: Destination coordinate in the same CRS.
+        city: Which city's network to route on (see ``GET /cities``); defaults
+            to the first configured city.
         mode: Which secondary route to compute — ``"alt"`` (accessibility,
             ``alt_distance``) or ``"veh_a"`` (type-A PMV lanes,
             ``veh_a_distance``).
@@ -108,12 +157,15 @@ async def create_route(
     Raises:
         HTTPException(400): if ``mode`` is unknown, or ``"veh_a"`` is requested
             but the graph has no ``veh_a_distance`` column.
-        HTTPException(404): if either endpoint is farther than ``max_snap_m``
-            from any node, or the endpoints are in disconnected components.
+        HTTPException(404): if ``city`` is unknown, either endpoint is farther
+            than ``max_snap_m`` from any node, or the endpoints are in
+            disconnected components.
     """
     coord1 = (x1, y1)
     coord2 = (x2, y2)
     snap = max_snap_m if max_snap_m > 0 else None
+
+    network = _network_for_city(city)
 
     if mode not in ("alt", "veh_a"):
         raise HTTPException(
@@ -149,6 +201,7 @@ async def create_route(
     return {
         "ruta": json.loads(ruta.to_json()),
         alt_key: json.loads(ruta_alt.to_json()),
+        "city": city,
         "mode": mode,
         "metadata": {
             "ruta": _route_metadata(ruta),

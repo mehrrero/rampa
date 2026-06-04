@@ -78,13 +78,42 @@ curl http://localhost:8000/health
 
 ---
 
+### `GET /cities`
+
+List the available city networks and the default used when `/ruta` omits `city`.
+
+```bash
+curl http://localhost:8000/cities
+```
+
+```json
+{"cities": ["valencia"], "default": "valencia"}
+```
+
+---
+
 ### `GET /ruta`
 
 Compute a route between two coordinates.
 
+All coordinates are in **EPSG:25830** (ETRS89 / UTM 30N, meters), so they differ
+per city. Use `GET /cities` for the available names; omit `city` to use the
+default (`valencia`).
+
+**Valencia** (default city — `city` may be omitted):
+
 ```bash
-curl "http://localhost:8000/ruta?x1=726550.22584&y1=4369304.840704&x2=725639.632903&y2=4374012.487261"
+curl "http://localhost:8000/ruta?city=valencia&x1=726538.273048&y1=4369685.099138&x2=725471.941018&y2=4371464.411097"
 ```
+
+**Madrid:**
+
+```bash
+curl "http://localhost:8000/ruta?city=madrid&x1=441936.50143&y1=4474738.053088&x2=438726.727451&y2=4474983.775073"
+```
+
+Add `&mode=veh_a` to either query to weight the secondary route by type-A
+PMV lanes instead of general accessibility (returned under `ruta_veh_a`).
 
 #### Query parameters
 
@@ -92,6 +121,7 @@ curl "http://localhost:8000/ruta?x1=726550.22584&y1=4369304.840704&x2=725639.632
 |-----------|------|----------|---------|-------------|
 | `x1`, `y1` | float | yes | — | Origin (x, y) in the network CRS (EPSG:25830) |
 | `x2`, `y2` | float | yes | — | Destination (x, y) in the network CRS |
+| `city` | string | no | first configured city | Which city's network to route on. See `GET /cities` for available names |
 | `mode` | string | no | `alt` | Accessibility route: `"alt"` (general accessibility) or `"veh_a"` (type-A PMV lanes) |
 | `max_snap_m` | float | no | `500` | Max snap distance (meters) from input coordinate to nearest network node. `≤ 0` disables the check |
 
@@ -101,6 +131,7 @@ curl "http://localhost:8000/ruta?x1=726550.22584&y1=4369304.840704&x2=725639.632
 {
   "ruta": { /* GeoJSON FeatureCollection */ },
   "ruta_alt": { /* GeoJSON FeatureCollection */ },
+  "city": "valencia",
   "mode": "alt",
   "metadata": {
     "ruta": { "total_length": 1250.7 },
@@ -138,7 +169,7 @@ Each feature in the GeoJSON `FeatureCollection` represents a sidewalk edge with 
 | Status | Meaning |
 |--------|---------|
 | `400` | Unknown `mode` or `veh_a` unavailable (DB lacks the column) |
-| `404` | Endpoint too far from network or endpoints in disconnected components |
+| `404` | Unknown `city`, endpoint too far from network, or endpoints in disconnected components |
 
 ---
 
@@ -147,9 +178,12 @@ Each feature in the GeoJSON `FeatureCollection` represents a sidewalk edge with 
 ### JavaScript / TypeScript (fetch)
 
 ```js
+// Valencia (default city). For Madrid, pass city: "madrid" and Madrid
+// EPSG:25830 coordinates, e.g. x1: "441936.50143", y1: "4474738.053088".
 const params = new URLSearchParams({
-  x1: "699200", y1: "4824000",
-  x2: "700000", y2: "4823000",
+  city: "valencia",
+  x1: "726538.273048", y1: "4369685.099138",
+  x2: "725471.941018", y2: "4371464.411097",
   mode: "alt",
 });
 
@@ -180,8 +214,9 @@ function RouteMap() {
 
   useEffect(() => {
     const params = new URLSearchParams({
-      x1: "699200", y1: "4824000",
-      x2: "700000", y2: "4823000",
+      city: "valencia", // or "madrid" with Madrid EPSG:25830 coordinates
+      x1: "726538.273048", y1: "4369685.099138",
+      x2: "725471.941018", y2: "4371464.411097",
       mode: "alt",
     });
 
@@ -211,12 +246,17 @@ make install
 make initialize
 ```
 
-`make initialize` runs `scripts/initialize.py`, which:
+`make initialize` runs `scripts/initialize.py`, which loops over every city in
+`config.yaml`'s `initialize.cities` list and, for each, writes a dedicated
+`nodes_<city>` / `edges_<city>` table pair into the single DuckDB. Per city it:
 
-1. **`load_graph`** — reads `data/graph.gpickle`, remaps coordinate-tuple node IDs to integers, mirrors undirected edges for pandana, and writes `nodes` / `edges` tables to DuckDB.
-2. **`fetch_dem` + `compute_elevation`** — downloads a LiDAR DEM (IDEE WCS), samples elevation per edge, writes slope.
-3. **`compute_valencia_features`** — fetches kerb and type-A PMV lane polylines from Valencia's open-data API, joins spatially onto edges.
+1. **`load_graph`** — reads the city's `graph_path`, remaps coordinate-tuple node IDs to integers, mirrors undirected edges for pandana, and writes the `nodes_<city>` / `edges_<city>` tables.
+2. **`fetch_dem` + `compute_elevation`** — downloads a LiDAR DEM (IDEE WCS), cached as `data/mdt_<city>.tif`, samples elevation per edge, writes slope.
+3. **`compute_overlay_features`** — if the city has an `overlay` block, fetches kerb and type-A PMV lane polylines from its open-data API and joins them spatially onto edges.
 4. **`compute_accesibility_distance`** — applies the accessibility cost model.
+
+The API (`Network` + `/ruta?city=…`) reads these per-city tables back, one
+`Network` per configured city.
 
 ### Run the API
 
@@ -241,23 +281,25 @@ uv run uvicorn src.api:app --reload --port 8000
 All settings live in [`config.yaml`](config.yaml):
 
 ```yaml
-crs: "EPSG:25830"                        # Coordinate reference system
+crs: "EPSG:25830"                        # default CRS (per-city override below)
 
 initialize:
   paths:
-    graph_path: "data/graph.gpickle"     # tile2net source graph
-    db_path: "data/network.duckdb"       # built DuckDB
-    dem_path: "data/mdt_lidar.tif"       # LiDAR DEM
-  elevation:                             # Per-edge slope computation
+    db_path: "data/network.duckdb"       # single DuckDB, one table pair per city
+  cities:                                # one entry per city to build
+    - name: valencia                     # → tables nodes_valencia / edges_valencia
+      graph_path: "data/graph.gpickle"   # tile2net source graph
+      crs: "EPSG:25830"                  # optional; overrides the top-level CRS
+      overlay:                           # open-data overlays (optional, per city)
+        kerb_url: "…"                    # ArcGIS REST: kerbs (bordillos)
+        type_a_url: "…"                  # ArcGIS REST: type-A PMV lanes
+        kerb_tol_m: 4.0
+        lane_tol_m: 5.0
+  elevation:                             # Per-edge slope computation (shared)
     samples_per_edge: 8
     wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
     coverage_id: "Elevacion4258_5"
-  valencia:                              # Open-data overlays
-    kerb_url: "…"                        # ArcGIS REST: kerbs (bordillos)
-    type_a_url: "…"                      # ArcGIS REST: type-A PMV lanes
-    kerb_tol_m: 4.0
-    lane_tol_m: 5.0
-  accessibility:                         # Cost model parameters
+  accessibility:                         # Cost model parameters (shared)
     width_threshold: 1.50
     k_up: 38.0
     k_down: 23.0
@@ -266,7 +308,17 @@ initialize:
     kerb_cross_cap: 2
 ```
 
-Comment out the `elevation` or `valencia` blocks to skip those steps during `make initialize`.
+Add more entries under `cities` to build several cities into the same DuckDB;
+give a city its own `crs` when its graph uses a different projection. Each
+city's LiDAR DEM is fetched automatically and cached next to the database as
+`mdt_<city>.tif` — no path to set. Comment out the shared `elevation` block to
+skip slope, or omit a city's `overlay` block (or just one of its URLs) to skip
+that layer during `make initialize`.
+
+The two overlays degrade gracefully: if a URL is missing **or its fetch fails**,
+the build doesn't abort. Kerbs fall back to flat (no crossing penalty), and
+`veh_a_distance` falls back to equal `alt_distance` — so type-A routing still
+works, it just matches the general accessibility route.
 
 ---
 
@@ -283,13 +335,14 @@ Comment out the `elevation` or `valencia` blocks to skip those steps during `mak
 ├── uv.lock                     # Locked dependency tree
 ├── data/
 │   ├── graph.gpickle           # tile2net source graph (OSMnx)
-│   ├── network.duckdb          # Built DuckDB (nodes, edges, accessibility)
-│   └── mdt_lidar.tif           # Digital Elevation Model (LiDAR)
+│   ├── network.duckdb          # Built DuckDB (nodes_<city> / edges_<city>)
+│   └── mdt_<city>.tif          # Auto-fetched DEM, one per city (LiDAR)
 ├── scripts/
-│   └── initialize.py           # Data pipeline: gpickle → DuckDB
+│   └── initialize.py           # Data pipeline: gpickle → DuckDB (per city)
 ├── src/
-│   ├── api.py                  # FastAPI application (/ruta, /health)
-│   └── network.py              # Network class (pandana routing engine)
+│   ├── api.py                  # FastAPI application (/ruta, /cities, /health)
+│   ├── network.py              # Network class (pandana routing engine)
+│   └── tables.py               # Per-city table-name helpers (shared)
 ├── docs/
 │   ├── alt_distance_proposal.pdf
 │   └── alt_distance_proposal.tex

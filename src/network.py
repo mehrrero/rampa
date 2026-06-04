@@ -17,6 +17,8 @@ from pyproj import Transformer
 import json
 from shapely.geometry import LineString, mapping
 
+from src.tables import city_tables
+
 logger = logging.getLogger(__name__)
 
 # Project-root config/config.yaml (this file lives in src/).
@@ -47,20 +49,37 @@ class Network:
         alt_network (pandana.Network): Pandana network weighted by ``alt_distance``.
     """
 
-    def __init__(self, db_path, cols: list = None, config_path=DEFAULT_CONFIG_PATH):
+    def __init__(self, db_path, city: str = None, cols: list = None,
+                 config_path=DEFAULT_CONFIG_PATH):
         """Open `db_path`, load nodes/edges, and build the pandana networks.
 
         Args:
             db_path: Path to the DuckDB file produced by
                 ``scripts/initialize.py``.
+            city: Which city's tables to load. ``initialize.py`` writes one
+                ``nodes_<city>`` / ``edges_<city>`` pair per city; pass the
+                city name here to select it. ``None`` falls back to the
+                legacy unsuffixed ``nodes`` / ``edges`` tables.
             cols: Reserved for forthcoming attribute selection; unused today.
-            config_path: Path to the shared project config. Only ``crs`` is
-                read at the moment.
+            config_path: Path to the shared project config. Used for the CRS
+                (top-level default, overridden by the selected city's ``crs``).
         """
-        # Load shared project settings (currently just the CRS).
+        # Load shared project settings. `crs` defaults to the top-level value
+        # but is overridden by the selected city's own `crs` when set, since
+        # different cities may store coordinates in different projections.
         with open(config_path, "r") as fh:
             cfg = yaml.safe_load(fh) or {}
         self.crs = cfg.get("crs", "EPSG:25830")
+
+        self.city = city
+        if city is not None:
+            self.nodes_table, self.edges_table = city_tables(city)
+            for c in cfg.get("initialize", {}).get("cities", []):
+                if c.get("name") == city:
+                    self.crs = c.get("crs", self.crs)
+                    break
+        else:
+            self.nodes_table, self.edges_table = "nodes", "edges"
 
         # `__init__` only ever runs once per instance, so the hasattr guard
         # is defensive — leave it in case a subclass calls `__init__` again.
@@ -83,9 +102,16 @@ class Network:
         # nullable columns); pandana is strict about types, so recast every
         # column it cares about before constructing the networks.
         try:
-            logger.info("Loading network from database")
-            self.nodes = self.db_connection.execute("SELECT * FROM nodes").fetchdf()
-            self.edges = self.db_connection.execute("SELECT * FROM edges").fetchdf()
+            logger.info(
+                "Loading network from database (%s / %s)",
+                self.nodes_table, self.edges_table,
+            )
+            self.nodes = self.db_connection.execute(
+                f'SELECT * FROM "{self.nodes_table}"'
+            ).fetchdf()
+            self.edges = self.db_connection.execute(
+                f'SELECT * FROM "{self.edges_table}"'
+            ).fetchdf()
             self.nodes.set_index('index', inplace=True)
             self.nodes['x'] = self.nodes['x'].astype('float64')
             self.nodes['y'] = self.nodes['y'].astype('float64')

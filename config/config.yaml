@@ -3,40 +3,67 @@
 # Shared values live at the top level. Per-script settings are namespaced
 # under the script name.
 
-# CRS of every coordinate stored in this project (graph, nodes/edges in
-# DuckDB, sidewalk widths, ...). Matches the tile2net source graph.
+# Default CRS of coordinates stored in this project (graph, nodes/edges in
+# DuckDB, sidewalk widths, ...). Matches the tile2net source graph. Each city
+# may override this with its own `crs` (see initialize.cities below).
 crs: "EPSG:25830"
 
 # Used by scripts/initialize.py
 initialize:
   paths:
-    graph_path: "data/graph.gpickle"
+    # Single DuckDB holding every city. `initialize` writes one
+    # `nodes_<city>` / `edges_<city>` table pair per entry in `cities` below.
     db_path: "data/network.duckdb"
-    dem_path: "data/mdt_lidar.tif"
-  # Edge attributes to copy from the source graph onto the `edges` table
+
+  # Cities to build, each from its own source graph. The `name` becomes the
+  # table suffix (slugified to a safe SQL identifier), so the API can select a
+  # city by name. `graph_path` is the pickled (tile2net-style) source graph.
+  #
+  # `crs` is optional and overrides the top-level default — set it when a city's
+  # graph uses a different projection (e.g. a different UTM zone).
+  #
+  # The DEM raster is fetched automatically (see the `elevation` block) and
+  # cached next to the database as `mdt_<city>.tif`, so there's no path to set.
+  #
+  # Per-city `overlay` is optional — it pulls city-specific open-data layers
+  # (kerbs + type-A PMV lanes) from ArcGIS REST services. Omit the block for a
+  # city with no such layers; the kerb / veh_a columns are simply skipped.
+  cities:
+    - name: valencia
+      graph_path: "data/valencia.gpickle"
+      crs: "EPSG:25830"
+      overlay:
+        kerb_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/UrbanismoEInfraestructuras/MapServer/307"
+        type_a_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/Trafico/MapServer/2"
+        # Max distance (m) for an edge to pick up a kerb / lane feature.
+        kerb_tol_m: 4.0
+        lane_tol_m: 5.0
+
+    - name: madrid
+      graph_path: "data/madrid.gpickle"
+      crs: "EPSG:25830"
+      overlay:
+        kerb_url: ""
+        type_a_url: ""
+        # Max distance (m) for an edge to pick up a kerb / lane feature.
+        kerb_tol_m: 4.0
+        lane_tol_m: 5.0
+
+  # Edge attributes to copy from the source graph onto each `edges` table
   # (in addition to the implicit `length` -> `distance` mapping).
   attributes:
     - width
+
   # Per-edge elevation derived from a DEM raster (PNOA-LiDAR MDT05 by default).
-  # Comment out the whole block to skip elevation during `make initialize`.
+  # Shared across cities (same national WCS source); each city's raster is
+  # cached at its own `dem_path`. Comment out the whole block to skip elevation.
   elevation:
     samples_per_edge: 8
-    # If `dem_path` doesn't already exist, fetch this WCS coverage into it.
+    # If a city's `dem_path` doesn't already exist, fetch this WCS coverage.
     wcs_url: "https://servicios.idee.es/wcs-inspire/mdt"
     coverage_id: "Elevacion4258_5"
     coverage_crs: "EPSG:4258"
     bbox_pad_m: 50.0
-  # Valencia open-data overlays joined onto edges by spatial proximity:
-  #   kerb / kerb_type ← cartografia-base-vorades-bordillos
-  #   access_veh_a     ← vehiculos-movilidad-personal-tipo-a
-  # Both layers are ArcGIS REST polyline services (native EPSG:25830).
-  # Comment out the whole block to skip during `make initialize`.
-  valencia:
-    kerb_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/UrbanismoEInfraestructuras/MapServer/307"
-    type_a_url: "https://geoportal.valencia.es/server/rest/services/OPENDATA/Trafico/MapServer/2"
-    # Max distance (m) for an edge to pick up a kerb / lane feature.
-    kerb_tol_m: 4.0
-    lane_tol_m: 5.0
 
   # Accessibility cost model (alt_distance) — Option 2 from
   # docs/alt_distance_proposal.pdf:
@@ -44,6 +71,7 @@ initialize:
   #                            / 10^accesibility
   # Defaults are CTE-anchored: k_up = ln(10)/0.06 (TMA/851 6% itinerary
   # limit), k_down = ln(10)/0.10 (DB-SUA 1 §4.3 steepest short-ramp limit).
+  # Shared across cities.
   accessibility:
     width_threshold: 1.50
     k_up: 38.0
