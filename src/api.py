@@ -79,23 +79,28 @@ CITY_NAMES.extend(
     if slugify_city(name) not in {slugify_city(c) for c in CITY_NAMES}
 )
 
-# One Network per configured city, built eagerly at import. Each reads its own
-# `nodes_<city>` / `edges_<city>` tables produced by scripts/initialize.py.
-# The first city in config is the default when a request omits `city`.
-networks: dict[str, Network] = {
-    slugify_city(name): Network(DB_PATH, city=name) for name in CITY_NAMES
-}
+# Networks are loaded lazily on the first route request. Building pandana's
+# contraction hierarchies for every city at import can exceed Railway startup
+# healthcheck timing and cause restart loops before `/health` is available.
+CITY_BY_KEY = {slugify_city(name): name for name in CITY_NAMES}
+networks: dict[str, Network] = {}
 DEFAULT_CITY = CITY_NAMES[0] if CITY_NAMES else None
 
 
 def _network_for_city(city: str) -> Network:
     """Resolve a `city` query value to its Network, or raise HTTP 404."""
-    net = networks.get(slugify_city(city))
-    if net is None:
+    key = slugify_city(city)
+    resolved_city = CITY_BY_KEY.get(key)
+    if resolved_city is None:
         raise HTTPException(
             status_code=404,
-            detail=f"unknown city {city!r}; available: {sorted(networks)}",
+            detail=f"unknown city {city!r}; available: {CITY_NAMES}",
         )
+
+    net = networks.get(key)
+    if net is None:
+        net = Network(DB_PATH, city=resolved_city)
+        networks[key] = net
     return net
 
 
