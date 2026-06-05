@@ -56,9 +56,24 @@ docker run --rm -p 8000:8000 \
 | Volume | Mount | Writable? | Purpose |
 |--------|-------|-----------|---------|
 | `./config` | `/app/config` | Yes | `config.yaml` — seeded from defaults on first start |
-| `./data` | `/app/data` | No (ro) | `network.duckdb`, `graph.gpickle`, DEM raster |
+| `./data` | `/app/data` | No (ro) | pre-built `network.duckdb` read by the API |
 
-> The database at `data/network.duckdb` is **already checked into the repo** for Valencia. If you're starting from scratch, run `make initialize` locally first (or copy a built database into `./data/`).
+> Docker/Railway runtime does not run `make initialize`. Build or update `data/network.duckdb` outside the container, then make that file available at `/app/data/network.duckdb`.
+
+### Railway
+
+Railway starts from the uploaded DuckDB, not from graph initialization:
+
+1. Build or update `data/network.duckdb` locally.
+2. Upload it to the T3/S3-compatible bucket:
+
+```bash
+T3_KEY_ID=... T3_KEY_SECRET=... T3_BUCKET=... python scripts/upload_to_t3.py
+```
+
+3. Deploy the Docker image with `T3_KEY_ID`, `T3_KEY_SECRET`, and `T3_BUCKET` set in Railway.
+
+On startup, `docker-entrypoint.sh` downloads only `network.duckdb` into `/app/data` and then starts `uvicorn`. Graph pickle and DEM files are not downloaded or used in deployment.
 
 ---
 

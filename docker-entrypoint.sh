@@ -18,22 +18,19 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cp "$DEFAULT_CONFIG" "$CONFIG_FILE"
 fi
 
-# ─── 2. Download data from T3 bucket ───────────────────────────────────
-# Skips files that already exist in /app/data/ so the download is
-# idempotent. network.duckdb is required (hard fail); graph.gpickle and
-# mdt_lidar.tif are optional (API can serve routes without them — they
-# are only needed for re-running initialize.py).
+# Download the pre-built DuckDB from T3. Railway does not run `make initialize`;
+# the API starts directly from /app/data/network.duckdb.
 DATA_DIR="/app/data"
 mkdir -p "$DATA_DIR"
 
 if [ -n "${T3_KEY_ID:-}" ] && [ -n "${T3_KEY_SECRET:-}" ] && [ -n "${T3_BUCKET:-}" ]; then
-    echo "T3 credentials detected — downloading network data..."
+    echo "T3 credentials detected — downloading network.duckdb..."
     python /app/scripts/t3_download.py
 else
     echo "T3 credentials not set — will rely on pre-existing /app/data/ contents."
 fi
 
-# ─── 3. Launch the API ────────────────────────────────────────────────
+# Launch the API.
 # Railway sets $PORT dynamically; default to 8000 for local/Docker runs.
 PORT="${PORT:-8000}"
 echo "Starting uvicorn on 0.0.0.0:$PORT …"

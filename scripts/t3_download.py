@@ -1,15 +1,11 @@
-"""Download network data files from Tigris (T3) bucket on container startup.
+"""Download the built DuckDB network from Tigris (T3) on startup.
 
 Used by the docker-entrypoint.sh on Railway to seed /app/data/ before the
 FastAPI process starts. Credentials are read from environment variables
 set in the Railway dashboard.
 
-Required files (hard fail if unreachable):
-    network.duckdb
-
-Optional files (logged warning on failure, API can still serve routes):
-    graph.gpickle   — only needed for re-running initialize.py
-    mdt_lidar.tif   — only needed for re-running initialize.py
+The container does not run ``make initialize``. It only needs the pre-built
+``network.duckdb`` uploaded to the bucket.
 """
 
 import logging
@@ -24,8 +20,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 DATA_DIR = Path("/app/data")
-REQUIRED = ["network.duckdb"]
-OPTIONAL = ["graph.gpickle", "mdt_lidar.tif"]
+NETWORK_DB = "network.duckdb"
 
 
 def _client():
@@ -81,15 +76,8 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     s3, bucket = _client()
 
-    failed = False
-
-    for filename in REQUIRED + OPTIONAL:
-        dest = DATA_DIR / filename
-        ok = download(s3, bucket, filename, dest)
-        if not ok and filename in REQUIRED:
-            failed = True
-
-    if failed:
+    dest = DATA_DIR / NETWORK_DB
+    if not download(s3, bucket, NETWORK_DB, dest):
         logger.error(
             "Required files could not be downloaded from T3 bucket '%s'. "
             "The API cannot start without network.duckdb.",
