@@ -61,10 +61,11 @@ def _network_for_city(city: str) -> Network:
     return net
 
 
-# Travel speeds (m/s) used to estimate traversal time per route.
-TRAVEL_SPEEDS_MS = cfg["api"]["travel_speeds"]
-WALKING_SPEED_MS = TRAVEL_SPEEDS_MS["walking"]
-WHEELCHAIR_SPEED_MS = TRAVEL_SPEEDS_MS["wheelchair"]
+# Travel speeds (m/s) used to estimate traversal time per route. Defaults keep
+# older mounted Railway configs working if they predate the `api:` section.
+TRAVEL_SPEEDS_MS = (cfg.get("api") or {}).get("travel_speeds") or {}
+WALKING_SPEED_MS = TRAVEL_SPEEDS_MS.get("walking", 1.24)
+WHEELCHAIR_SPEED_MS = TRAVEL_SPEEDS_MS.get("wheelchair", 0.7)
 
 
 def _format_duration(seconds: float) -> str:
