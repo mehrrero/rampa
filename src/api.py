@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.network import Network
+from src.tables import slugify_city
 
 
 # Project-root config/config.yaml (this file lives in src/).
@@ -39,20 +40,57 @@ app.add_middleware(
 )
 
 DB_PATH = cfg["initialize"]["paths"]["db_path"]
-CITY_NAMES = [c["name"] for c in cfg["initialize"].get("cities", [])]
+
+
+def _discover_city_names(db_path: str) -> list[str]:
+    """Return city names backed by nodes_<city>/edges_<city> table pairs."""
+    try:
+        with duckdb.connect(db_path, read_only=True) as con:
+            tables = {
+                row[0]
+                for row in con.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main'"
+                ).fetchall()
+            }
+    except Exception:
+        return []
+
+    cities = []
+    for table in sorted(tables):
+        if not table.startswith("nodes_"):
+            continue
+        city = table.removeprefix("nodes_")
+        if f"edges_{city}" in tables:
+            cities.append(city)
+    return cities
+
+
+CONFIG_CITY_NAMES = [c["name"] for c in cfg["initialize"].get("cities", [])]
+DISCOVERED_CITY_NAMES = _discover_city_names(DB_PATH)
+DISCOVERED_CITY_KEYS = {slugify_city(name): name for name in DISCOVERED_CITY_NAMES}
+
+CITY_NAMES = [
+    name for name in CONFIG_CITY_NAMES
+    if slugify_city(name) in DISCOVERED_CITY_KEYS
+]
+CITY_NAMES.extend(
+    name for name in DISCOVERED_CITY_NAMES
+    if slugify_city(name) not in {slugify_city(c) for c in CITY_NAMES}
+)
 
 # One Network per configured city, built eagerly at import. Each reads its own
 # `nodes_<city>` / `edges_<city>` tables produced by scripts/initialize.py.
 # The first city in config is the default when a request omits `city`.
 networks: dict[str, Network] = {
-    name: Network(DB_PATH, city=name) for name in CITY_NAMES
+    slugify_city(name): Network(DB_PATH, city=name) for name in CITY_NAMES
 }
 DEFAULT_CITY = CITY_NAMES[0] if CITY_NAMES else None
 
 
 def _network_for_city(city: str) -> Network:
     """Resolve a `city` query value to its Network, or raise HTTP 404."""
-    net = networks.get(city)
+    net = networks.get(slugify_city(city))
     if net is None:
         raise HTTPException(
             status_code=404,
@@ -110,7 +148,7 @@ async def healthcheck():
 @app.get("/cities")
 async def list_cities():
     """Available city networks and the default used when `city` is omitted."""
-    return {"cities": sorted(networks), "default": DEFAULT_CITY}
+    return {"cities": CITY_NAMES, "default": DEFAULT_CITY}
 
 
 @app.get("/ruta")
