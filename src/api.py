@@ -239,7 +239,7 @@ async def create_route(
             status_code=400,
             detail=f"unknown mode {mode!r}; expected 'alt' or 'veh_a'.",
         )
-    if mode == "veh_a" and network.veh_a_network is None:
+    if mode == "veh_a" and not network.has_mode("veh_a"):
         raise HTTPException(
             status_code=400,
             detail=(

@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import gc
 from pathlib import Path
 import pandas as pd
 import geopandas as gpd
@@ -119,44 +120,20 @@ class Network:
             self.edges['to'] = self.edges['to'].astype('int64')
             self.edges['distance'] = self.edges['distance'].astype('float64')
             self.edges['alt_distance'] = self.edges['alt_distance'].astype('float64')
+            self._available_modes = {"distance", "alt"}
+            self._network_cache = {}
             # `veh_a_distance` (type-A PMV metric) is optional — only present
-            # once the Valencia + accessibility steps have written it.
+            # once the city overlay + accessibility steps have written it.
             if 'veh_a_distance' in self.edges.columns:
                 self.edges['veh_a_distance'] = self.edges['veh_a_distance'].astype('float64')
+                self._available_modes.add("veh_a")
         except Exception as e:
             logger.error("Error loading network from database: %s", e)
             return
 
-        # Build parallel pandana networks over the same node/edge tables,
-        # differing only in which weight column drives shortest-path. Keeping
-        # them all materialised lets `route()` switch between them per call
-        # without rebuilding the graph.
-        self.alt_network = pandana.Network(
-            self.nodes['x'],
-            self.nodes['y'],
-            self.edges['from'],
-            self.edges['to'],
-            self.edges[['alt_distance']],
-        )
-
-        self.network = pandana.Network(
-            self.nodes['x'],
-            self.nodes['y'],
-            self.edges['from'],
-            self.edges['to'],
-            self.edges[['distance']],
-        )
-
-        # Optional third network for the type-A PMV metric, when present.
-        self.veh_a_network = None
-        if 'veh_a_distance' in self.edges.columns:
-            self.veh_a_network = pandana.Network(
-                self.nodes['x'],
-                self.nodes['y'],
-                self.edges['from'],
-                self.edges['to'],
-                self.edges[['veh_a_distance']],
-            )
+    def has_mode(self, mode: str) -> bool:
+        """Whether this city has the edge weight column for `mode`."""
+        return mode in getattr(self, "_available_modes", set())
 
     def _network_for(self, mode):
         """Resolve a routing `mode` to its pandana network.
@@ -165,21 +142,40 @@ class Network:
         ``"veh_a"`` (type-A PMV). Raises ``ValueError`` for an unknown mode or
         when ``"veh_a"`` is requested but the graph has no ``veh_a_distance``.
         """
-        nets = {
-            "distance": self.network,
-            "alt": self.alt_network,
-            "veh_a": self.veh_a_network,
+        weight_cols = {
+            "distance": "distance",
+            "alt": "alt_distance",
+            "veh_a": "veh_a_distance",
         }
-        if mode not in nets:
+        if mode not in weight_cols:
             raise ValueError(
-                f"unknown routing mode {mode!r}; expected one of {sorted(nets)}"
+                f"unknown routing mode {mode!r}; expected one of {sorted(weight_cols)}"
             )
-        net = nets[mode]
-        if net is None:
+        if not self.has_mode(mode):
             raise ValueError(
                 f"routing mode {mode!r} unavailable: the graph has no "
                 "veh_a_distance column (run the Valencia + accessibility steps)."
             )
+
+        net = self._network_cache.get(mode)
+        if net is not None:
+            return net
+
+        # Keep only one contraction hierarchy in memory at a time. A route
+        # response may need distance + alt/veh_a sequentially, but retaining
+        # both can exceed Railway memory on the larger city network.
+        self._network_cache.clear()
+        gc.collect()
+
+        col = weight_cols[mode]
+        net = pandana.Network(
+            self.nodes['x'],
+            self.nodes['y'],
+            self.edges['from'],
+            self.edges['to'],
+            self.edges[[col]],
+        )
+        self._network_cache[mode] = net
         return net
 
     def route(self, coord1, coord2, mode="distance", alternate=False,
