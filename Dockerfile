@@ -29,6 +29,11 @@ WORKDIR /app
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1 \
     PATH="/app/.venv/bin:$PATH"
 
 # Resolve dependencies first (cached unless pyproject/uv.lock change), so code
