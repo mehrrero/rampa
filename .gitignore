@@ -147,6 +147,9 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Vendored / patched source builds (see Makefile patch-pandana)
+vendor/
+
 # Environments
 .env
 .envrc

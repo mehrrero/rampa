@@ -1,8 +1,11 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
+import asyncio
 import json
+import logging
 import math
+import time
 
 import duckdb
 import geopandas as gpd
@@ -12,6 +15,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.network import Network
+
+logger = logging.getLogger(__name__)
 
 
 # Project-root config/config.yaml (this file lives in src/).
@@ -23,7 +28,13 @@ with open(CONFIG_PATH) as fh:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("App is starting…")
-    yield
+    # `network_cache` is module-level but defined further down — resolved at
+    # call time, i.e. once the whole module (and the cache) is loaded.
+    eviction_task = asyncio.create_task(network_cache._eviction_loop())
+    try:
+        yield
+    finally:
+        eviction_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -40,23 +51,100 @@ app.add_middleware(
 
 DB_PATH = cfg["initialize"]["paths"]["db_path"]
 CITY_NAMES = [c["name"] for c in cfg["initialize"].get("cities", [])]
-
-# One Network per configured city, built eagerly at import. Each reads its own
-# `nodes_<city>` / `edges_<city>` tables produced by scripts/initialize.py.
-# The first city in config is the default when a request omits `city`.
-networks: dict[str, Network] = {
-    name: Network(DB_PATH, city=name) for name in CITY_NAMES
-}
 DEFAULT_CITY = CITY_NAMES[0] if CITY_NAMES else None
 
+# How long an unused city Network stays in memory before being released.
+# Configurable via `api.network_idle_ttl_seconds`; any `/ruta` request for a
+# city resets its timer, and `GET /health` (re)loads every configured city.
+NETWORK_IDLE_TTL_S = cfg["api"].get("network_idle_ttl_seconds", 300)
+# Check for idle networks at roughly half the TTL (so an expired entry is
+# noticed within ~1.5x the TTL), capped to keep the loop responsive for short
+# TTLs without polling needlessly often for long ones (e.g. the 300s default).
+_EVICTION_INTERVAL_S = min(30.0, max(NETWORK_IDLE_TTL_S / 2.0, 1.0))
 
-def _network_for_city(city: str) -> Network:
+
+class NetworkCache:
+    """Lazily builds per-city `Network`s and releases them after idle TTL.
+
+    Building a `Network` means constructing its pandana routing graph(s) —
+    real CPU/RAM work even with the binary CH cache from
+    `scripts/initialize.py`. Loading every configured city eagerly at import
+    (the previous behaviour) means an idle server holds all of them in memory
+    forever. Instead, a city's `Network` is built on first use — or warmed by
+    `GET /health`, which loads every configured city — and dropped again once
+    it hasn't been touched for `ttl_seconds`; a background loop checks for
+    expired entries every `_EVICTION_INTERVAL_S` seconds.
+    """
+
+    def __init__(self, db_path: str, city_names: list[str], ttl_seconds: float):
+        self._db_path = db_path
+        self._city_names = set(city_names)
+        self._ttl = ttl_seconds
+        self._networks: dict[str, Network] = {}
+        self._last_access: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(self, city: str) -> Optional[Network]:
+        """Return `city`'s Network — building it on first use — or `None` if
+        `city` isn't configured. Resets the city's idle timer either way."""
+        if city not in self._city_names:
+            return None
+        async with self._lock:
+            net = self._networks.get(city)
+            if net is None:
+                logger.info("Loading network for city %r…", city)
+                t0 = time.monotonic()
+                loop = asyncio.get_running_loop()
+                net = await loop.run_in_executor(None, Network, self._db_path, city)
+                self._networks[city] = net
+                logger.info(
+                    "Loaded network for city %r in %.2fs (now in memory: %s)",
+                    city, time.monotonic() - t0, sorted(self._networks),
+                )
+            self._last_access[city] = time.monotonic()
+            return net
+
+    async def warm_all(self) -> None:
+        """Load (or refresh the timer on) every configured city's Network."""
+        for name in self._city_names:
+            await self.get(name)
+
+    async def evict_idle(self) -> None:
+        """Drop Networks that have sat unused longer than the idle TTL."""
+        now = time.monotonic()
+        async with self._lock:
+            expired = [
+                city for city, last in self._last_access.items()
+                if now - last >= self._ttl
+            ]
+            for city in expired:
+                self._networks.pop(city, None)
+                self._last_access.pop(city, None)
+                logger.info(
+                    "Unloaded idle network for city %r (idle ≥ %.0fs; still in "
+                    "memory: %s)",
+                    city, self._ttl, sorted(self._networks),
+                )
+
+    async def _eviction_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_EVICTION_INTERVAL_S)
+            try:
+                await self.evict_idle()
+            except Exception:
+                logger.exception("Network eviction pass failed")
+
+
+network_cache = NetworkCache(DB_PATH, CITY_NAMES, NETWORK_IDLE_TTL_S)
+
+
+async def _network_for_city(city: str) -> Network:
     """Resolve a `city` query value to its Network, or raise HTTP 404."""
-    net = networks.get(city)
+    net = await network_cache.get(city)
     if net is None:
         raise HTTPException(
             status_code=404,
-            detail=f"unknown city {city!r}; available: {sorted(networks)}",
+            detail=f"unknown city {city!r}; available: {sorted(CITY_NAMES)}",
         )
     return net
 
@@ -103,13 +191,25 @@ def _route_metadata(ruta) -> dict:
 
 @app.get("/health")
 async def healthcheck():
+    """Liveness probe — also (re)warms every configured city's Network.
+
+    Networks are loaded lazily and released after `network_idle_ttl_seconds`
+    of inactivity (see `NetworkCache`); hitting `/health` builds any that
+    aren't currently loaded and resets every city's idle timer, so a
+    monitoring probe doubles as a way to keep the cache warm.
+    """
+    await network_cache.warm_all()
     return {"status": "ok"}
 
 
 @app.get("/cities")
 async def list_cities():
-    """Available city networks and the default used when `city` is omitted."""
-    return {"cities": sorted(networks), "default": DEFAULT_CITY}
+    """Configured city networks and the default used when `city` is omitted.
+
+    Listing doesn't require loading a city's Network — that happens lazily on
+    `/ruta` (or eagerly via `/health`).
+    """
+    return {"cities": sorted(CITY_NAMES), "default": DEFAULT_CITY}
 
 
 @app.get("/ruta")
@@ -188,14 +288,14 @@ async def create_route(
     coord2 = (x2, y2)
     snap = max_snap_m if max_snap_m > 0 else None
 
-    network = _network_for_city(city)
+    network = await _network_for_city(city)
 
     if mode not in ("alt", "veh_a"):
         raise HTTPException(
             status_code=400,
             detail=f"unknown mode {mode!r}; expected 'alt' or 'veh_a'.",
         )
-    if mode == "veh_a" and network.veh_a_network is None:
+    if mode == "veh_a" and not network.has_veh_a:
         raise HTTPException(
             status_code=400,
             detail=(

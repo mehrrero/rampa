@@ -18,7 +18,7 @@ import pandas as pd
 import yaml
 from shapely.geometry import LineString
 
-from src.tables import city_tables, slugify_city
+from src.tables import city_tables, network_cache_paths, slugify_city
 
 logger = logging.getLogger(__name__)
 
@@ -955,6 +955,73 @@ def compute_accesibility_distance(
         con.close()
 
 
+def build_network_cache(
+    db_path: str | Path,
+    cache_dir: str | Path,
+    city: str,
+    nodes_table: str = "nodes",
+    edges_table: str = "edges",
+) -> None:
+    """Build the city's routing network once and persist it in binary form.
+
+    Mirrors the dtype handling of ``Network.__get_network`` (so the cached
+    network matches what the API would otherwise build at request time), then
+    writes two artefacts via ``network_cache_paths``:
+
+        - ``pdna_<city>.h5``   — lean nodes/edges/impedances (pandana's own
+          ``save_hdf5``; no geometry, kerb, or elevation columns).
+        - ``pdna_<city>_ch_*.bin`` — the precomputed contraction hierarchies,
+          one per impedance (``save_ch``, from the CH-serialization patch at
+          https://github.com/jamescollinharky/pandanaPatch).
+
+    ``Network`` then loads both via ``pandana.Network.from_hdf5(path,
+    ch_path=...)``, skipping the slow CH rebuild (the dominant cost of
+    constructing a routing network) on every API start. Building the network
+    here — once, in the batch job — rather than at API startup is the whole
+    point: the expensive step happens exactly once per city, on disk, instead
+    of being repeated (and held in RAM) by every server process.
+
+    Requires a pandana build with ``Network.save_ch`` (the CH-serialization
+    patch); raises ``AttributeError`` loudly otherwise so a stock-pandana
+    install doesn't silently skip caching.
+    """
+    import pandana
+
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        nodes = con.execute(f'SELECT * FROM "{nodes_table}"').fetchdf()
+        edges = con.execute(f'SELECT * FROM "{edges_table}"').fetchdf()
+    finally:
+        con.close()
+
+    nodes = nodes.set_index('index')
+    nodes['x'] = nodes['x'].astype('float64')
+    nodes['y'] = nodes['y'].astype('float64')
+    edges['from'] = edges['from'].astype('int64')
+    edges['to'] = edges['to'].astype('int64')
+    edges['distance'] = edges['distance'].astype('float64')
+    edges['alt_distance'] = edges['alt_distance'].astype('float64')
+
+    impedance_cols = ['distance', 'alt_distance']
+    if 'veh_a_distance' in edges.columns:
+        edges['veh_a_distance'] = edges['veh_a_distance'].astype('float64')
+        impedance_cols.append('veh_a_distance')
+
+    h5_path, ch_prefix = network_cache_paths(cache_dir, city)
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Building routing network for %r (%d nodes, %d edges, impedances=%s)…",
+        city, len(nodes), len(edges), impedance_cols,
+    )
+    net = pandana.Network(
+        nodes['x'], nodes['y'], edges['from'], edges['to'], edges[impedance_cols],
+    )
+    net.save_hdf5(str(h5_path))
+    net.save_ch(str(ch_prefix))
+    logger.info(
+        "Cached network for %r → %s, %s_*.bin", city, h5_path, ch_prefix,
+    )
 
 
 
@@ -1075,5 +1142,17 @@ if __name__ == "__main__":
             slope_cap=acc_cfg.get("slope_cap", 0.30),
             k_kerb=acc_cfg.get("k_kerb", math.log(10)),
             kerb_cross_cap=acc_cfg.get("kerb_cross_cap", 2),
+            edges_table=edges_table,
+        )
+
+        # Build the routing network once, here, and cache it in binary form
+        # (lean nodes/edges + precomputed contraction hierarchies) so the API
+        # loads it directly instead of rebuilding the CH — by far the slowest
+        # part of constructing a pandana network — on every start.
+        build_network_cache(
+            db_path=db_path,
+            cache_dir=dem_dir,
+            city=name,
+            nodes_table=nodes_table,
             edges_table=edges_table,
         )

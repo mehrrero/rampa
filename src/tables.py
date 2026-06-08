@@ -10,6 +10,7 @@ can import cheaply.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 
 def slugify_city(name: str) -> str:
@@ -29,3 +30,19 @@ def city_tables(name: str) -> tuple[str, str]:
     """Return the ``(nodes_table, edges_table)`` pair for a city name."""
     slug = slugify_city(name)
     return f"nodes_{slug}", f"edges_{slug}"
+
+
+def network_cache_paths(cache_dir, name: str) -> tuple[Path, Path]:
+    """Return ``(hdf5_path, ch_prefix)`` for a city's cached pandana network.
+
+    ``scripts/initialize.py`` builds each city's routing network once and
+    persists it here — the HDF5 file holds the lean nodes/edges/impedances,
+    and ``ch_prefix`` is the base path for the precomputed contraction
+    hierarchies (``<ch_prefix>_0.bin``, ``_1.bin``, … — one per impedance,
+    written by the patched ``pandana.Network.save_ch``). ``Network`` then
+    loads both via ``pandana.Network.from_hdf5(path, ch_path=ch_prefix)``,
+    skipping the slow CH rebuild on every API start.
+    """
+    slug = slugify_city(name)
+    cache_dir = Path(cache_dir)
+    return cache_dir / f"pdna_{slug}.h5", cache_dir / f"pdna_{slug}_ch"

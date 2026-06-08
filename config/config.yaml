@@ -98,3 +98,11 @@ api:
   travel_speeds:
     walking: 1.24
     wheelchair: 0.7
+
+  # Networks are no longer built eagerly at import — each city's Network
+  # (and its routing pandana graphs) is loaded on first use and then kept in
+  # memory for this many seconds of inactivity before being released, so an
+  # idle server doesn't hold every configured city's network in RAM. Any
+  # `/ruta` request for a city resets its timer; `GET /health` is what
+  # triggers the (lazy) load in the first place.
+  network_idle_ttl_seconds: 10
