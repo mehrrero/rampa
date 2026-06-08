@@ -125,7 +125,7 @@ class Network:
             self.edges['distance'] = self.edges['distance'].astype('float64')
             self.edges['alt_distance'] = self.edges['alt_distance'].astype('float64')
             # `veh_a_distance` (type-A PMV metric) is optional — only present
-            # once the Valencia + accessibility steps have written it.
+            # once the city overlay + accessibility steps have written it.
             if 'veh_a_distance' in self.edges.columns:
                 self.edges['veh_a_distance'] = self.edges['veh_a_distance'].astype('float64')
         except Exception as e:
@@ -197,6 +197,12 @@ class Network:
             self.city, h5_path,
         )
         return net
+
+    def has_mode(self, mode: str) -> bool:
+        """Whether this city has the edge weight column for `mode`."""
+        return mode in {"distance", "alt"} or (
+            mode == "veh_a" and self.veh_a_network is not None
+        )
 
     def _network_for(self, mode):
         """Resolve a routing `mode` to ``(pandana network, impedance name)``.

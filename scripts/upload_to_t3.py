@@ -1,16 +1,13 @@
-"""Upload pre-built data files to a Tigris (T3) bucket.
+"""Upload the pre-built DuckDB network to a Tigris (T3) bucket.
 
-Run once locally after ``make initialize`` to push the network database,
-graph pickle, and DEM raster to the T3 bucket. The Railway deployment
-then downloads them on container startup.
+Run locally after ``make initialize`` to push ``data/network.duckdb`` to the
+T3 bucket. The Railway deployment downloads that file on container startup and
+does not run initialization.
 
 Credentials are passed via environment variables (see README section
-for Railway setup). Files are uploaded with paths matching what the
-download script expects:
+for Railway setup). The object key matches what the download script expects:
 
-    network.duckdb   — required
-    graph.gpickle     — optional (re-initialization only)
-    mdt_lidar.tif     — optional (re-initialization only)
+    network.duckdb
 
 Usage:
     T3_KEY_ID=... T3_KEY_SECRET=... T3_BUCKET=... python scripts/upload_to_t3.py
@@ -31,7 +28,7 @@ logging.basicConfig(
 )
 
 DATA_DIR = Path("data")
-FILES = ["network.duckdb", "graph.gpickle", "mdt_lidar.tif"]
+NETWORK_DB = "network.duckdb"
 
 
 def _client():
@@ -75,24 +72,25 @@ def _human_size(size: int) -> str:
 def main():
     s3, bucket = _client()
 
-    for filename in FILES:
-        local = DATA_DIR / filename
-        if not local.exists() or local.stat().st_size == 0:
-            logger.warning(
-                "Skipping %s — file not found or empty in %s/", filename, DATA_DIR
-            )
-            continue
+    local = DATA_DIR / NETWORK_DB
+    if not local.exists() or local.stat().st_size == 0:
+        logger.error("%s not found or empty in %s/", NETWORK_DB, DATA_DIR)
+        sys.exit(1)
 
-        size = local.stat().st_size
-        logger.info(
-            "Uploading %s (%s) → s3://%s/%s …", filename, _human_size(size), bucket, filename
-        )
-        try:
-            s3.upload_file(str(local), bucket, filename)
-        except Exception as exc:
-            logger.error("Upload failed for %s: %s", filename, exc)
-            sys.exit(1)
-        logger.info("  Done.")
+    size = local.stat().st_size
+    logger.info(
+        "Uploading %s (%s) → s3://%s/%s …",
+        NETWORK_DB,
+        _human_size(size),
+        bucket,
+        NETWORK_DB,
+    )
+    try:
+        s3.upload_file(str(local), bucket, NETWORK_DB)
+    except Exception as exc:
+        logger.error("Upload failed for %s: %s", NETWORK_DB, exc)
+        sys.exit(1)
+    logger.info("  Done.")
 
     logger.info("Upload complete.")
 

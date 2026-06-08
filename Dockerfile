@@ -1,8 +1,8 @@
 # API image for the `rampa` sidewalk-routing service.
 #
-# Only the application code lives in the image. The runtime inputs — a `config/`
-# folder and the `data/` directory (network.duckdb, DEM, graphs) — are NOT baked
-# in; mount them as volumes at run time:
+# Only the application code lives in the image. The runtime inputs are a
+# `config/` folder and the pre-built DuckDB at `data/network.duckdb`; graph/DEM
+# initialization is not run inside the deployment image.
 #
 #   docker build -t rampa-api .
 #   docker run --rm -p 8000:8000 \
@@ -41,7 +41,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 # dependency, kept out of pyproject/uv.lock.
 RUN uv pip install boto3
 
-# Application source only — the config folder and data/ are mounted at runtime.
+# Application source only — config and data are supplied at runtime.
 COPY src ./src
 COPY scripts ./scripts
 
