@@ -35,8 +35,11 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 # edits don't bust the dependency layer. --no-install-project: the app isn't a
 # package to install, just a source tree we copy in below.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+RUN uv sync --frozen --no-install-project --no-dev
+
+# boto3 for T3 (Tigris) bucket downloads on Railway startup — a deployment-only
+# dependency, kept out of pyproject/uv.lock.
+RUN uv pip install boto3
 
 # Application source only — the config folder and data/ are mounted at runtime.
 COPY src ./src
@@ -49,12 +52,6 @@ COPY config/config.yaml ./config.default.yaml
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Documents the expected mount points. config/ is writable (entrypoint seeds
-# the default there); data/ holds the network DB. An unmounted data volume
-# yields an empty dir, which fails fast at startup — intended.
-VOLUME ["/app/config", "/app/data"]
-
 EXPOSE 8000
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]
